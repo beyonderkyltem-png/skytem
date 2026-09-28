@@ -72,6 +72,15 @@ async function useMongoAuthState() {
 
     const creds = (await readData('creds')) || initAuthCreds();
 
+    // Escrituras de creds en cola: siempre se guarda el estado MÁS reciente y en orden
+    let cola = Promise.resolve();
+    const guardarCreds = () => {
+        cola = cola
+            .then(() => writeData('creds', creds))
+            .catch((e) => console.error('Error guardando creds en Mongo:', e.message));
+        return cola;
+    };
+
     return {
         state: {
             creds,
@@ -100,7 +109,8 @@ async function useMongoAuthState() {
                 }
             }
         },
-        saveCreds: () => writeData('creds', creds),
+        saveCreds: guardarCreds,
+        flush: () => cola,
         clearAll: () => AuthDoc.deleteMany({ _id: new RegExp(`^${SESSION_ID}:`) })
     };
 }
@@ -236,7 +246,8 @@ const INICIO = Math.floor(Date.now() / 1000);
 const procesados = new Set();
 
 async function iniciarSocket() {
-    const { state, saveCreds, clearAll } = await useMongoAuthState();
+    const { state, saveCreds, flush, clearAll } = await useMongoAuthState();
+    console.log(`[SESIÓN] al iniciar -> registrada: ${!!state.creds.registered}, cuenta: ${state.creds.me?.id || 'ninguna'}`);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -255,7 +266,7 @@ async function iniciarSocket() {
     sock.ev.on('creds.update', saveCreds);
 
     // Código de vinculación (sin QR)
-    if (!sock.authState.creds.registered) {
+    if (!sock.authState.creds.registered && !sock.authState.creds.account) {
         const numero = (process.env.WHATSAPP_NUMBER || '').replace(/\D/g, '');
         if (!numero) {
             console.error('Define WHATSAPP_NUMBER (con código de país, solo dígitos) para vincular con código.');
@@ -285,6 +296,8 @@ async function iniciarSocket() {
                 console.log('Sesión cerrada desde el teléfono. Borrando sesión guardada...');
                 await clearAll();
             }
+            // Espera a que las credenciales terminen de guardarse antes de reconectar
+            await flush();
             // Reintenta siempre (si se cerró sesión, pedirá un código nuevo)
             setTimeout(() => iniciarSocket().catch((e) => console.error('Error al reconectar:', e)), 3000);
         }
