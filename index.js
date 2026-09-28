@@ -12,7 +12,8 @@ if (ffmpegPath) {
     process.env.PATH = `${path.dirname(ffmpegPath)}${path.delimiter}${process.env.PATH}`;
 }
 
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
+const { MongoStore } = require('wwebjs-mongo');
 const mongoose = require('mongoose');
 const qrcode = require('qrcode-terminal');
 const axios = require('axios');
@@ -129,8 +130,14 @@ async function startBot() {
     await mongoose.connect(MONGO_URI);
     console.log('Conectado a MongoDB Atlas.');
 
+    const store = new MongoStore({ mongoose: mongoose });
+
     const client = new Client({
-        authStrategy: new LocalAuth(),
+        authStrategy: new RemoteAuth({
+            clientId: 'skytem',
+            store: store,
+            backupSyncIntervalMs: 300000
+        }),
         ffmpegPath: ffmpegPath,
         puppeteer: {
             args: [
@@ -149,6 +156,13 @@ async function startBot() {
         console.log('Escanea el código QR:');
         qrcode.generate(qr, { small: true });
     });
+
+    client.on('remote_session_saved', () => {
+        console.log('Sesión guardada en MongoDB.');
+    });
+
+    client.on('authenticated', () => console.log('Autenticado.'));
+    client.on('auth_failure', (m) => console.error('Fallo de autenticación:', m));
 
     client.on('ready', () => {
         console.log('SKYTEM activo con IA ilimitada.');
