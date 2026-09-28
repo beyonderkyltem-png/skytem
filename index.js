@@ -60,6 +60,7 @@ const Perfil = mongoose.model('Perfil', new mongoose.Schema({
     cercania: Number,
     interacciones: Number,
     preguntasNombre: Number,
+    muestras: [String],
     ultimaVez: Date
 }, { versionKey: false }));
 
@@ -68,7 +69,7 @@ const Grupo = mongoose.model('Grupo', new mongoose.Schema({
     resumen: String,
     chistes: [String],
     recientes: [new mongoose.Schema({
-        j: String, n: String, t: String, r: String, b: Boolean, ts: Number
+        j: String, n: String, t: String, r: String, b: Boolean, p: String, ts: Number
     }, { _id: false })],
     desdeActualizacion: Number
 }, { versionKey: false }));
@@ -180,10 +181,17 @@ const ACCIONES = {
 
 /* ------------------------------ Utilidades ------------------------------ */
 
+// Acepta varios nombres de variable y limpia espacios, saltos de línea o comillas que se cuelan al pegar la key
+const POLL_KEY = (process.env.POLLINATIONS_API_KEY || process.env.POLLINATIONS_KEY || process.env.POLLINATIONS_TOKEN || '')
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
+
 async function llm({ messages, temperature = 0.9, maxTokens = 200 }) {
     const headers = { 'Content-Type': 'application/json' };
-    if (process.env.POLLINATIONS_API_KEY) {
-        headers['Authorization'] = `Bearer ${process.env.POLLINATIONS_API_KEY}`;
+    if (POLL_KEY) {
+        headers['Authorization'] = `Bearer ${POLL_KEY}`;
     }
     const pedir = (extra) => fetch('https://gen.pollinations.ai/v1/chat/completions', {
         method: 'POST',
@@ -200,6 +208,11 @@ async function llm({ messages, temperature = 0.9, maxTokens = 200 }) {
     // Algunos modelos rechazan temperature/max_tokens: se reintenta sin ellos
     if (response.status === 400) response = await pedir({});
 
+    if (response.status === 401) {
+        console.error(POLL_KEY
+            ? `[LLM] 401: Pollinations rechazó la key enviada (empieza por "${POLL_KEY.slice(0, 3)}", ${POLL_KEY.length} caracteres). Debe ser una key de https://enter.pollinations.ai/keys (sk_...).`
+            : '[LLM] 401: no se envió ninguna key. Define POLLINATIONS_API_KEY en las variables de entorno de Render y vuelve a desplegar.');
+    }
     if (!response.ok) {
         const detalle = await response.text().catch(() => '');
         throw new Error(`Pollinations API error: ${response.status} ${response.statusText} ${detalle}`);
@@ -426,16 +439,24 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
     await memoria.registrarMensaje({ chat, jid, nombre, texto, respondiendoA });
     memoria.tick(chat);
 
+    // Multimedia sin texto (sticker, foto, audio...): se guarda para el contexto, pero no dispara respuesta
+    if (!forzar && /^\[[^\]]+\]$/.test(texto)) return;
+
     const mencionaAlBot = ctx?.mentionedJid?.some((j) => yo.has(soloNumero(j)));
     const respondeAlBot = ctx?.participant && yo.has(soloNumero(ctx.participant));
     const mencionaAOtro = ctx?.mentionedJid?.some((j) => !yo.has(soloNumero(j)));
     const respondeAOtro = ctx?.participant && !respondeAlBot;
 
     // directo: te hablan a ti · ambiguo: dijeron tu nombre, quizá no contigo · espontaneo: te metes solo
+    // seguimiento: llevan una conversación seguida con SKYTEM (2+ turnos) y esta persona sigue sin citarlo ni mencionarlo
+    const dirigidoAOtro = mencionaAOtro || respondeAOtro;
+    const seg = !dirigidoAOtro && esGrupo ? await memoria.seguimiento(chat, jid) : null;
+
     let modo = null;
     if (forzar || !esGrupo || mencionaAlBot || respondeAlBot) modo = 'directo';
+    else if (seg) modo = 'seguimiento';
     else if (NOMBRE_BOT.test(texto)) modo = 'ambiguo';
-    else if (!mencionaAOtro && !respondeAOtro && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION)) modo = 'espontaneo';
+    else if (!dirigidoAOtro && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION)) modo = 'espontaneo';
     if (!modo) return;
 
     await enCola(chat, async () => {
@@ -444,7 +465,7 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
             if (modo === 'directo') sock.sendPresenceUpdate('composing', chat).catch(() => {});
             mensajes = await memoria.responder({ chat, jid, nombre, texto, modo, esGrupo });
         } catch (e) {
-            console.error('Error generando respuesta:', e.message);
+            console.error('Error generando respuesta:', e.message, `(modo: ${modo}, mensaje: "${texto.slice(0, 40)}")`);
             if (modo !== 'directo') return;
             mensajes = ['uff se me colgó el cerebro jaja, repite'];
         }
@@ -456,7 +477,8 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
             await sock.sendMessage(chat, { text: mensajes[i] }, opciones);
             await sock.sendPresenceUpdate('paused', chat).catch(() => {});
             await memoria.registrarMensaje({
-                chat, jid: 'skytem', nombre: 'SKYTEM', texto: mensajes[i], deBot: true
+                chat, jid: 'skytem', nombre: 'SKYTEM', texto: mensajes[i], deBot: true,
+                para: modo === 'espontaneo' ? '' : jid
             });
         }
     });
@@ -754,6 +776,9 @@ async function main() {
     console.log('Conectando a MongoDB...');
     await mongoose.connect(MONGO_URI);
     console.log('Conectado a MongoDB Atlas.');
+    console.log(POLL_KEY
+        ? `[LLM] Pollinations key detectada (empieza por "${POLL_KEY.slice(0, 3)}", ${POLL_KEY.length} caracteres).`
+        : '[LLM] ATENCIÓN: no hay key de Pollinations (POLLINATIONS_API_KEY).');
 
     // La memoria vive en RAM y se guarda cada 30 s y al apagar
     setInterval(() => memoria.persistirTodo().catch((e) => console.error('Error guardando memoria:', e.message)), 30_000);

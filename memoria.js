@@ -11,6 +11,7 @@
 const MAX_RECIENTES = 40;
 const MAX_HECHOS = 25;
 const MAX_CHISTES = 8;
+const MAX_MUESTRAS = 15; // mensajes recientes de cada persona, para imitar cómo escribe
 const CONTEXTO_MENSAJES = 25;
 const ACTUALIZAR_CADA = 12; // mensajes nuevos del chat antes de consolidar memoria
 
@@ -41,13 +42,14 @@ LO MÁS IMPORTANTE: entender la conversación.
 
 Cómo escribes:
 - Corto: normalmente una sola frase de 3 a 15 palabras. Solo te alargas si piden una explicación de verdad.
-- Escribe como escribe el grupo: copia su forma de hablar, sus expresiones y su jerga tal como aparecen en la conversación. No metas jerga que ellos no usan ni frases de "hablar joven" a la fuerza.
+- Escribes como se escribe de verdad en WhatsApp, no como un texto cuidado: informal, sin esmerarte con la ortografía ni la puntuación. Imita la forma de escribir de la persona con la que hablas (te la describo en ESTILO DE ESCRITURA): sus abreviaciones, cómo se ríe, si alarga letras, sus expresiones y su jerga. No metas jerga que ellos no usan.
+- Adapta el largo al de la persona: si escribe dos palabras, respondes igual de corto.
 - Nunca uses emojis ni emoticones.
 - Humor seco e ironía suave, burla cariñosa. Te ríes con la gente, no de ella. Nada de bromas sobre cuerpo, salud, familia, dinero u orientación de nadie.
 - Sin muletillas repetidas: no abras siempre igual ni abuses de las risas.
 - No hables por hablar: si no tienes nada que aportar, contesta lo mínimo. No comentes lo obvio, no metas chistes forzados y no repitas lo que te dijeron.
 - Usa el nombre de la persona solo de vez en cuando, no en cada mensaje.
-- Puedes hacer una pregunta cuando de verdad te da curiosidad por lo que contaron, pero nada de preguntas de relleno.
+- Casi nunca haces preguntas y casi nunca terminas un mensaje con una. Preguntar es la excepción: casi siempre afirmas, comentas, bromeas o reaccionas.
 - Nada de listas, títulos, ofrecer ayuda ni preguntas de cortesía al final. No repitas lo que te dijeron.
 
 Lo que nunca haces:
@@ -95,6 +97,70 @@ export function partirMensajes(texto) {
         .map((s) => s.slice(0, 280));
 }
 
+const RISA = /^(?:j[aeiosj]){2,}[a-z]*$|^(?:ha){2,}h?$|^k{3,}$|^xd+$/i;
+const ABREV = new Set(['q', 'pq', 'xq', 'tmb', 'tb', 'toy', 'ta', 'pa', 'ntp', 'xfa', 'bn', 'nose']);
+const ESTILO_DEFAULT = { minusculas: true, sinPunto: true, sinApertura: true, sinTildes: false, risa: '', abrevia: [], alarga: false, palabras: 0 };
+
+/** Mira cómo escribe alguien (mayúsculas, puntos, tildes, risas, abreviaciones...) a partir de sus mensajes. */
+export function analizarEstilo(muestras) {
+    const ms = (muestras || []).map((m) => String(m || '').trim()).filter(Boolean);
+    if (ms.length < 4) return null;
+    const n = ms.length;
+    const texto = ms.join(' ');
+    const tokens = texto.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const risas = {};
+    const abrev = new Set();
+    for (const tk of tokens) {
+        if (RISA.test(tk)) risas[tk] = (risas[tk] || 0) + 1;
+        if (ABREV.has(tk)) abrev.add(tk);
+    }
+    const risa = Object.entries(risas).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+    const sinMayus = ms.filter((m) => !/\p{Lu}/u.test(m)).length;
+    const conPunto = ms.filter((m) => /(?<!\.)\.$/.test(m)).length;
+    const preguntas = ms.filter((m) => /\?/.test(m));
+    const conApertura = preguntas.filter((m) => /¿/.test(m)).length;
+    const letras = (texto.match(/\p{L}/gu) || []).length;
+    const tildes = (texto.match(/[áéíóú]/gi) || []).length;
+    return {
+        minusculas: sinMayus / n >= 0.7,
+        sinPunto: conPunto / n <= 0.15,
+        sinApertura: preguntas.length === 0 ? true : conApertura / preguntas.length < 0.3,
+        sinTildes: letras >= 150 && tildes / letras < 0.002,
+        risa,
+        abrevia: [...abrev].slice(0, 5),
+        alarga: ms.filter((m) => /(\p{L})\1{2,}/u.test(m)).length >= 2,
+        palabras: Math.round(tokens.length / n)
+    };
+}
+
+/** Ajusta lo que escribió el modelo al estilo de la persona (así no depende de que el modelo obedezca). */
+export function adaptarEstilo(texto, e = ESTILO_DEFAULT) {
+    let t = String(texto ?? '');
+    if (e.risa) t = t.replace(/\p{L}+/gu, (w) => (RISA.test(w) ? e.risa : w));
+    if (e.sinApertura) t = t.replace(/[¿¡]/g, '');
+    if (e.sinPunto) t = t.replace(/(?<!\.)\.\s*$/, '');
+    if (e.minusculas) t = t.toLowerCase();
+    if (e.sinTildes) {
+        t = t.replace(/ñ/g, '\u0001').replace(/Ñ/g, '\u0002')
+            .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+            .replace(/\u0001/g, 'ñ').replace(/\u0002/g, 'Ñ');
+    }
+    return t.trim();
+}
+
+function describirEstilo(e, muestras) {
+    const l = [e.minusculas ? 'todo en minúsculas, incluidas las risas' : 'mayúsculas normales'];
+    if (e.sinPunto) l.push('sin punto final');
+    if (e.sinApertura) l.push('sin ¿ ni ¡');
+    if (e.sinTildes) l.push('sin tildes');
+    if (e.risa) l.push(`se ríe con "${e.risa}"`);
+    if (e.abrevia?.length) l.push(`abrevia (${e.abrevia.join(', ')})`);
+    if (e.alarga) l.push('alarga letras cuando se emociona (holaaa)');
+    if (e.palabras) l.push(`mensajes de unas ${e.palabras} palabras: responde con un largo parecido`);
+    const ej = (muestras || []).slice(-6).map((m) => `- "${m}"`).join('\n');
+    return l.map((x) => `- ${x}`).join('\n') + (ej ? `\nEjemplos de cómo escribe:\n${ej}` : '');
+}
+
 export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
     const perfiles = new Map();
     const grupos = new Map();
@@ -110,7 +176,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         if (!p) {
             p = {
                 _id: jid, nombre, apodo: '', hechos: [], notas: '',
-                cercania: 10, interacciones: 0, preguntasNombre: 0, ultimaVez: new Date()
+                cercania: 10, interacciones: 0, preguntasNombre: 0, muestras: [], ultimaVez: new Date()
             };
         }
         perfiles.set(jid, p);
@@ -140,11 +206,11 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
     /* ---------------------------- Registro ---------------------------- */
 
-    async function registrarMensaje({ chat, jid, nombre, texto, respondiendoA = '', deBot = false }) {
+    async function registrarMensaje({ chat, jid, nombre, texto, respondiendoA = '', deBot = false, para = '' }) {
         const g = await getGrupo(chat);
         g.recientes.push({
             j: jid, n: limpiar(nombre, 40), t: limpiar(texto, 400),
-            r: limpiar(respondiendoA, 120), b: deBot, ts: Date.now()
+            r: limpiar(respondiendoA, 120), b: deBot, p: deBot ? para : '', ts: Date.now()
         });
         if (g.recientes.length > MAX_RECIENTES) g.recientes.splice(0, g.recientes.length - MAX_RECIENTES);
         g.desdeActualizacion = (g.desdeActualizacion || 0) + 1;
@@ -154,8 +220,55 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             const p = await getPerfil(jid, nombre);
             if (nombreUtil(nombre) && p.nombre !== nombre) p.nombre = limpiar(nombre, 40);
             p.ultimaVez = new Date();
+
+            // Muestras de cómo escribe (para imitarlo). Se omiten multimedia y datos sensibles.
+            const muestra = limpiar(texto, 160);
+            if (muestra && !/^\[/.test(muestra) && !SENSIBLE.test(muestra)) {
+                p.muestras = p.muestras || [];
+                p.muestras.push(muestra);
+                if (p.muestras.length > MAX_MUESTRAS) p.muestras.splice(0, p.muestras.length - MAX_MUESTRAS);
+            }
             sucios.perfiles.add(jid);
         }
+    }
+
+    /**
+     * ¿Este mensaje sigue una CONVERSACIÓN SEGUIDA entre el bot y esta persona?
+     * Hace falta que el bot ya le haya respondido a esta persona al menos 2 veces seguidas (ida y vuelta,
+     * cada turno pegado al anterior) y que el último mensaje del bot sea reciente (3 min, o 60 s si otros hablaron en medio).
+     * Un solo mensaje del bot seguido de un "hola" suelto NO cuenta.
+     */
+    async function seguimiento(chat, jid) {
+        const g = await getGrupo(chat);
+        const r = g.recientes;
+        const ahora = Date.now();
+
+        let i = r.length - 1;
+        let otrosEnMedio = false;
+        for (; i >= 0; i--) {
+            if (r[i].b) break;
+            if (r[i].j !== jid) otrosEnMedio = true;
+        }
+        if (i < 0 || r[i].p !== jid) return null;
+        if (ahora - r[i].ts > (otrosEnMedio ? 60 * 1000 : 3 * 60 * 1000)) return null;
+
+        // Cuenta los turnos: una tanda de mensajes seguidos del bot hacia esta persona = 1 turno
+        let turnos = 0;
+        let enTanda = false;
+        for (let k = i; k >= 0; k--) {
+            const m = r[k];
+            if (ahora - m.ts > 10 * 60 * 1000) break;
+            if (k < i && r[k + 1].ts - m.ts > 4 * 60 * 1000) break; // hubo un silencio largo: otra charla
+            if (m.b) {
+                if (m.p !== jid) break; // le habló a otra persona: se cortó
+                if (!enTanda) turnos++;
+                enTanda = true;
+            } else {
+                enTanda = false;
+            }
+        }
+        if (turnos < 2) return null;
+        return { otrosEnMedio, turnos };
     }
 
     /** ¿Toca consolidar la memoria de este chat? Se lanza en segundo plano. */
@@ -203,7 +316,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         return etiquetas;
     }
 
-    function construirMensajes({ g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre }) {
+    function construirMensajes({ g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre, estilo, muestras, estiloDe, otrosEnMedio }) {
         const partes = [PERSONA];
         const nombreH = etiquetas.get(jid);
 
@@ -237,13 +350,17 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             );
         }
 
-        if (modo === 'directo') {
+        if (modo === 'directo' || modo === 'seguimiento') {
             partes.push(
                 'CAPTURA DE NOMBRE: si en el mensaje la persona dice claramente cómo se llama o cómo quiere que le digas (o te corrige el nombre), ' +
                 'empieza tu respuesta con [NOMBRE: el nombre] y sigue con tu respuesta normal. Si no lo dijo en este mensaje, no pongas nada. ' +
                 'Nunca inventes el nombre.'
             );
         }
+
+        partes.push(
+            `ESTILO DE ESCRITURA (imita cómo escribe ${estiloDe}: su forma de escribir, no sus frases):\n${describirEstilo(estilo, muestras)}`
+        );
 
         const transcripcion = g.recientes
             .slice(-CONTEXTO_MENSAJES)
@@ -258,11 +375,18 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             cierre = 'Nadie te habló a ti. Mete un comentario solo si de verdad aporta algo (gracioso o útil) sobre lo último que se dijo. Si no, responde exactamente NO_RESPONDER.';
         } else if (modo === 'ambiguo') {
             cierre = `${nombreH} escribió: "${texto}"\nMencionó tu nombre, pero puede que no te hable a ti sino que hable de ti con otros. Si te habla a ti, responde. Si no, responde exactamente NO_RESPONDER.`;
+        } else if (modo === 'seguimiento') {
+            cierre = `Vienen teniendo una conversación seguida con ${nombreH} (varios mensajes de ida y vuelta) y acaba de escribir: "${texto}"\n` +
+                (otrosEnMedio
+                    ? 'Entre medio hablaron otras personas, así que fíjate bien en el contexto. '
+                    : 'Nadie más habló entre ustedes. ') +
+                'Responde solo si el mensaje continúa el hilo de lo que venían hablando o contesta a lo que dijiste. ' +
+                'Si es un saludo suelto, un tema nuevo que no tiene que ver, un acuse (ok, jaja) o suena a que le habla al grupo o a otra persona, responde exactamente NO_RESPONDER.';
         } else {
             cierre = `${nombreH} te dice: "${texto}"\nResponde a ESE mensaje, con sentido y usando el contexto de arriba.`;
             if (esGrupo) cierre += ' Si es solo un acuse (ok, jaja, gracias, un sticker) y no hay nada que contestar, responde exactamente NO_RESPONDER.';
             if (preguntarNombre) {
-                cierre += `\nAún no sabes cómo prefiere que le digan a ${nombreH} (así aparece en WhatsApp). Pregúntale de forma natural y corta cómo se llama o cómo le dicen, dentro de tu respuesta, sin que suene a formulario. Si en este mismo mensaje ya te dijo su nombre, no preguntes. Si te hizo una pregunta práctica, respóndela primero.`;
+                cierre += `\nAún no sabes cómo prefiere que le digan a ${nombreH} (así aparece en WhatsApp). Solo si el momento es natural (un saludo o charla suelta), pregúntale cómo le dicen, corto y sin que suene a formulario. Si su mensaje es una pregunta o un tema concreto, respóndelo y no preguntes nada. Si en este mismo mensaje ya te dijo su nombre, no preguntes.`;
             }
         }
 
@@ -275,7 +399,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         ];
     }
 
-    /** modo: 'directo' (te hablan), 'ambiguo' (dijeron tu nombre, quizá no contigo) o 'espontaneo' */
+    /** modo: 'directo' (te hablan), 'seguimiento' (siguen la charla contigo), 'ambiguo' (dijeron tu nombre, quizá no contigo) o 'espontaneo' */
     async function responder({ chat, jid, nombre, texto = '', modo = 'directo', esGrupo = true }) {
         const g = await getGrupo(chat);
         const hablante = await getPerfil(jid, nombre);
@@ -287,13 +411,26 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         const idsOtros = [...new Set(ventana.filter((m) => m.j !== jid).map((m) => m.j))].slice(0, 3);
         const otros = await Promise.all(idsOtros.map((id) => getPerfil(id)));
 
-        // ¿toca preguntarle cómo se llama? (máx. 2 veces en total, la segunda ya con algo de confianza)
+        const seg = modo === 'seguimiento' ? await seguimiento(chat, jid) : null;
+
+        // Estilo de escritura: el de la persona; si tiene pocas muestras, el de la charla
+        let muestras = (hablante.muestras || []).slice(-MAX_MUESTRAS);
+        let estilo = analizarEstilo(muestras);
+        let estiloDe = hablante.apodo || (nombreUtil(hablante.nombre) ? hablante.nombre : 'esta persona');
+        if (!estilo) {
+            muestras = ventana.map((m) => m.t).filter((t) => t && !/^\[/.test(t)).slice(-MAX_MUESTRAS);
+            estilo = analizarEstilo(muestras);
+            estiloDe = 'la charla';
+        }
+        estilo = estilo || ESTILO_DEFAULT;
+
+        // Preguntar el nombre: una sola vez, y solo cuenta si de verdad preguntó
         const pn = hablante.preguntasNombre || 0;
-        const preguntarNombre = modo === 'directo' && !hablante.apodo &&
-            (pn === 0 || (pn === 1 && (hablante.interacciones || 0) >= 5));
+        const preguntarNombre = modo === 'directo' && !hablante.apodo && pn === 0;
 
         const mensajes = construirMensajes({
-            g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre
+            g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre,
+            estilo, muestras, estiloDe, otrosEnMedio: !!seg?.otrosEnMedio
         });
         let bruto = String(await llm({ messages: mensajes, temperature: 0.8, maxTokens: 160 }) ?? '');
 
@@ -312,15 +449,15 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
         const salida = limpiarSalida(bruto);
         if (/NO_RESPONDER/i.test(salida)) return [];
-        if (!salida) return capturado ? [`un gusto, ${capturado}`] : [];
+        if (!salida) return capturado ? [adaptarEstilo(`un gusto, ${capturado}`, estilo)] : [];
 
         if (modo !== 'espontaneo') {
             hablante.interacciones = (hablante.interacciones || 0) + 1;
             hablante.cercania = clamp((hablante.cercania ?? 10) + 0.4, 0, 100);
-            if (preguntarNombre) hablante.preguntasNombre = pn + 1;
+            if (preguntarNombre && /\?/.test(salida)) hablante.preguntasNombre = pn + 1;
             sucios.perfiles.add(jid);
         }
-        return partirMensajes(salida);
+        return partirMensajes(salida).map((m) => adaptarEstilo(m, estilo)).filter(Boolean);
     }
 
     /** Nombre de alguien a partir de su jid (tolera que llegue en otro formato: mismo número, distinto sufijo). */
@@ -441,6 +578,7 @@ Reglas:
             p.apodo ? `Te llamo: ${p.apodo}` : null,
             p.hechos.length ? `Lo que sé de ti:\n${p.hechos.map((h) => `• ${h}`).join('\n')}` : null,
             p.notas ? `Cómo lo veo: ${p.notas}` : null,
+            p.muestras?.length ? 'Guardo unos mensajes tuyos para imitar cómo escribes (se borran con !olvidame).' : null,
             `Confianza: ${Math.round(p.cercania)}/100`
         ].filter(Boolean).join('\n');
     }
@@ -463,7 +601,7 @@ Reglas:
     }
 
     return {
-        registrarMensaje, tick, debeIntervenir, responder, actualizar, nombreDe,
+        registrarMensaje, tick, debeIntervenir, responder, actualizar, nombreDe, seguimiento,
         persistirTodo, verPerfil, olvidarPerfil, olvidarGrupo
     };
 }
