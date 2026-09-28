@@ -10,9 +10,14 @@
 
 const MAX_RECIENTES = 40;
 const MAX_HECHOS = 25;
-const MAX_CHISTES = 8;
+const MAX_CHISTES = 5;
 const MAX_MUESTRAS = 15; // mensajes recientes de cada persona, para imitar cómo escribe
-const CONTEXTO_MENSAJES = 25;
+const MUESTRAS_EJEMPLO = 3; // cuántos ejemplos de su escritura se le enseñan al modelo (pocos: así no copia sus temas)
+const CONTEXTO_MENSAJES = 12; // mensajes de contexto que lee el modelo (antes 25: mezclaba charlas distintas)
+const VENTANA_MS = 20 * 60 * 1000; // solo se lee lo de los últimos 20 min: lo viejo ya no es "la conversación"
+const MAX_RELEVANTES = 3; // recuerdos que se pueden colar en un mensaje
+const ULTIMAS_PROPIAS = 5; // últimos mensajes del bot que se le muestran para que no se repita
+const PENALIZACIONES = { frequency_penalty: 0.6, presence_penalty: 0.4 };
 const ACTUALIZAR_CADA = 12; // mensajes nuevos del chat antes de consolidar memoria
 
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
@@ -21,6 +26,54 @@ const norm = (s) => String(s ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLo
 // Un nombre "útil" tiene al menos 2 letras y no es solo un número de teléfono
 const nombreUtil = (n) => (String(n ?? '').match(/\p{L}/gu) || []).length >= 2;
 const limpiar = (s, max) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+// Solo lo de los últimos minutos cuenta como "la conversación actual"
+const contextoReciente = (g) => {
+    const desde = Date.now() - VENTANA_MS;
+    return g.recientes.filter((m) => (m.ts || 0) >= desde).slice(-CONTEXTO_MENSAJES);
+};
+
+// Palabras con contenido, recortadas a 5 letras (trabajo/trabaja/trabajando coinciden)
+const RELLENO = new Set([
+    'para', 'pero', 'como', 'esta', 'este', 'esto', 'esos', 'esas', 'estoy', 'estas', 'porque', 'cuando', 'donde',
+    'tiene', 'tengo', 'solo', 'muy', 'mucho', 'poco', 'bien', 'pues', 'entonces', 'ahora', 'aqui', 'alli', 'todo',
+    'todos', 'algo', 'nada', 'cosa', 'cosas', 'hacer', 'hace', 'tambien', 'aunque', 'sobre', 'desde', 'hasta',
+    'entre', 'quiero', 'puedo', 'vamos', 'dime', 'digo', 'dice', 'jaja', 'jajaja', 'hola', 'gracias', 'grupo', 'hablan', 'hablar'
+]);
+const raices = (t) => new Set(
+    norm(t).split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !RELLENO.has(w)).map((w) => w.slice(0, 5))
+);
+const coincidencias = (t, refSet) => {
+    let n = 0;
+    for (const r of raices(t)) if (refSet.has(r)) n++;
+    return n;
+};
+
+/** Solo devuelve los recuerdos que tienen que ver con lo que se está hablando AHORA (así no arrastra temas viejos). */
+function relevantes(items, referencia, { min = 1, max = MAX_RELEVANTES } = {}) {
+    const ref = raices(referencia);
+    if (!ref.size) return [];
+    return (items || []).filter((it) => coincidencias(it, ref) >= min).slice(-max);
+}
+
+const tokens = (t) => norm(t).split(/[^a-z0-9]+/).filter(Boolean);
+
+/** ¿Este borrador es casi igual a algo que el bot ya dijo (misma frase o mismo arranque)? */
+function esRepetido(candidato, previos) {
+    const a = tokens(candidato);
+    if (a.length < 3) return false;
+    const A = new Set(a);
+    return (previos || []).some((p) => {
+        const b = tokens(p);
+        if (b.length < 3) return false;
+        const B = new Set(b);
+        let inter = 0;
+        for (const w of A) if (B.has(w)) inter++;
+        const jaccard = inter / (A.size + B.size - inter);
+        const mismoArranque = a.length >= 5 && b.length >= 5 && a.slice(0, 4).join(' ') === b.slice(0, 4).join(' ');
+        return jaccard >= 0.7 || mismoArranque;
+    });
+}
 
 // Filtro de seguridad: nunca se guardan datos sensibles aunque el modelo los proponga
 const SENSIBLE = new RegExp(
@@ -34,23 +87,26 @@ const SENSIBLE = new RegExp(
 
 const PERSONA = `Eres SKYTEM, un bot que vive en un chat de WhatsApp con amigos. Todos saben que eres un bot y no lo escondes, pero no actúas como asistente: hablas como un amigo más del grupo.
 
-LO MÁS IMPORTANTE: entender la conversación.
-- Fíjate en quién le habla a quién. Un mensaje que responde a otra persona, o que menciona a otra persona, NO es para ti aunque lo leas.
-- Contesta a lo que te dicen de verdad y sobre el tema. Si es una broma, sigue la broma. Si es una pregunta, respóndela. No sueltes comentarios sueltos que no vengan al caso.
+REGLA Nº 1: RESPONDE A LO ÚLTIMO QUE TE DIJERON.
+- Tu respuesta debe contestar directamente el mensaje actual y tener sentido con la conversación reciente. Si es una pregunta, respóndela. Si es una broma, sigue la broma. Si es un comentario, reacciona a ese comentario.
+- Solo puedes apoyarte en lo que aparece en la conversación reciente. Nunca inventes hechos, recuerdos ni cosas que nadie dijo.
+- Manda siempre el mensaje más nuevo. Si la persona cambia de tema, cambias con ella y te olvidas del tema anterior. Jamás traigas de vuelta un tema pasado por tu cuenta.
+- Lo que aparezca como MEMORIA DE FONDO es solo contexto por si el mensaje actual trata de eso. Si no viene al caso, ignóralo por completo.
+- Un mensaje que responde a otra persona, o que la menciona, NO es para ti aunque lo leas.
 - Si algo no lo entiendes (un chiste interno, una referencia, una foto, sticker o audio que no puedes ver), dilo corto y natural en vez de inventar.
-- Usa lo que sabes de la persona solo si viene al caso. No lo sueltes por soltarlo y no inventes recuerdos.
+
+NO TE REPITAS:
+- Cada respuesta tiene que ser distinta a tus mensajes anteriores: otras palabras, otro chiste, otra forma de empezar. Nunca reutilices una frase, muletilla o expresión que ya usaste.
+- Tampoco repitas lo que te dijo la persona.
 
 Cómo escribes:
-- Corto: normalmente una sola frase de 3 a 15 palabras. Solo te alargas si piden una explicación de verdad.
-- Escribes como se escribe de verdad en WhatsApp, no como un texto cuidado: informal, sin esmerarte con la ortografía ni la puntuación. Imita la forma de escribir de la persona con la que hablas (te la describo en ESTILO DE ESCRITURA): sus abreviaciones, cómo se ríe, si alarga letras, sus expresiones y su jerga. No metas jerga que ellos no usan.
-- Adapta el largo al de la persona: si escribe dos palabras, respondes igual de corto.
+- Natural y corto: normalmente una frase, dos como máximo. Solo te alargas si piden una explicación de verdad. Lo importante es que se entienda y suene a persona real.
+- Escribes como en WhatsApp: informal. Copia la FORMA de escribir de la persona (ver ESTILO DE ESCRITURA): abreviaciones, cómo se ríe, largo de sus mensajes. No copies sus frases ni sus temas.
 - Nunca uses emojis ni emoticones.
-- Humor seco e ironía suave, burla cariñosa. Te ríes con la gente, no de ella. Nada de bromas sobre cuerpo, salud, familia, dinero u orientación de nadie.
-- Sin muletillas repetidas: no abras siempre igual ni abuses de las risas.
-- No hables por hablar: si no tienes nada que aportar, contesta lo mínimo. No comentes lo obvio, no metas chistes forzados y no repitas lo que te dijeron.
-- Usa el nombre de la persona solo de vez en cuando, no en cada mensaje.
-- Casi nunca haces preguntas y casi nunca terminas un mensaje con una. Preguntar es la excepción: casi siempre afirmas, comentas, bromeas o reaccionas.
-- Nada de listas, títulos, ofrecer ayuda ni preguntas de cortesía al final. No repitas lo que te dijeron.
+- Humor ligero solo cuando encaja con lo que se está diciendo; si no encaja, responde normal. Te ríes con la gente, no de ella. Nada de bromas sobre cuerpo, salud, familia, dinero u orientación de nadie.
+- Usa el nombre de la persona solo de vez en cuando.
+- Solo preguntas si de verdad lo necesitas para poder responder. Nada de listas, títulos, ofrecer ayuda ni preguntas de cortesía al final.
+- Si no tienes nada útil que aportar, contesta lo mínimo.
 
 Lo que nunca haces:
 - No dices "como IA" ni te presentas.
@@ -58,11 +114,11 @@ Lo que nunca haces:
 - Nada de contenido sexual explícito ni odio hacia grupos de personas.
 - Si alguien pregunta en serio si eres una persona o una IA, no lo niegues: dilo con humor y sigue.`;
 
-function descripcionCercania(c) {
-    if (c < 20) return 'apenas se conocen: sé amable y algo neutro, no asumas confianza.';
+function descripcionCercania(c = 10) {
+    if (c < 20) return 'apenas se conocen: tono amable y neutro, sin asumir confianza.';
     if (c < 50) return 'ya se conocen: puedes bromear con confianza ligera.';
-    if (c < 75) return 'hay buena confianza: bromas más directas y referencias a cosas que han hablado.';
-    return 'son panas de verdad: burla cariñosa, chistes internos, total confianza.';
+    if (c < 75) return 'hay buena confianza: bromas más directas.';
+    return 'son panas de verdad: burla cariñosa y total confianza.';
 }
 
 function extraerJSON(texto) {
@@ -157,8 +213,9 @@ function describirEstilo(e, muestras) {
     if (e.abrevia?.length) l.push(`abrevia (${e.abrevia.join(', ')})`);
     if (e.alarga) l.push('alarga letras cuando se emociona (holaaa)');
     if (e.palabras) l.push(`mensajes de unas ${e.palabras} palabras: responde con un largo parecido`);
-    const ej = (muestras || []).slice(-6).map((m) => `- "${m}"`).join('\n');
-    return l.map((x) => `- ${x}`).join('\n') + (ej ? `\nEjemplos de cómo escribe:\n${ej}` : '');
+    const ej = (muestras || []).slice(-MUESTRAS_EJEMPLO).map((m) => `- "${m}"`).join('\n');
+    return l.map((x) => `- ${x}`).join('\n') +
+        (ej ? `\nEjemplos de su forma de escribir (solo para copiar la FORMA; no retomes sus temas ni sus frases):\n${ej}` : '');
 }
 
 export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
@@ -293,12 +350,6 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
     /* ---------------------------- Respuesta ---------------------------- */
 
-    const hace = (ts) => {
-        const min = Math.round((Date.now() - (ts || Date.now())) / 60000);
-        if (min < 30) return '';
-        return min < 90 ? `[hace ${min} min] ` : `[hace ${Math.round(min / 60)} h] `;
-    };
-
     /** Nombre único por persona: apodo (como quiere que le digan) > nombre de WhatsApp > "alguien (…1234)". */
     async function calcularEtiquetas(ids) {
         const base = new Map();
@@ -316,39 +367,38 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         return etiquetas;
     }
 
-    function construirMensajes({ g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre, estilo, muestras, estiloDe, otrosEnMedio }) {
+    function construirMensajes({ g, hablante, jid, etiquetas, texto, modo, esGrupo, preguntarNombre, estilo, muestras, estiloDe, otrosEnMedio, historial, citaActual, propias, referencia }) {
         const partes = [PERSONA];
         const nombreH = etiquetas.get(jid);
 
         partes.push(
-            'QUIÉN ES QUIÉN: cada línea de la conversación empieza con el nombre de quien la escribió, y las de SKYTEM son tuyas. ' +
+            'QUIÉN ES QUIÉN: cada línea de la conversación empieza con el nombre de quien la escribió, y las de SKYTEM son tuyas (entre paréntesis dice a quién le hablabas). ' +
             'No confundas a unas personas con otras ni le atribuyas a alguien lo que dijo otra. Los números entre paréntesis, como (…1234), solo sirven para distinguir a dos personas con el mismo nombre: nunca los escribas.'
         );
 
-        if (g.resumen || g.chistes.length) {
+        // Memoria: SOLO lo que tiene que ver con lo que se habla ahora. Lo demás se queda guardado pero no entra al prompt.
+        const refSet = raices(referencia);
+        const hechos = relevantes(hablante.hechos, referencia);
+        const nota = hablante.notas && coincidencias(hablante.notas, refSet) >= 1 ? hablante.notas : '';
+        const chistes = relevantes(g.chistes, referencia);
+        const resumen = g.resumen && coincidencias(g.resumen, refSet) >= 2 ? g.resumen : '';
+
+        const recuerdos = [];
+        if (resumen) recuerdos.push(`- Lo que se ha hablado antes en este chat: ${resumen}`);
+        if (chistes.length) recuerdos.push(`- Chistes internos que vienen al caso: ${chistes.join(' | ')}`);
+        if (recuerdos.length) {
             partes.push(
-                `MEMORIA DE ${esGrupo ? 'ESTE GRUPO' : 'ESTA CONVERSACIÓN'}:\n` +
-                (g.resumen ? `- Qué se ha hablado: ${g.resumen}\n` : '') +
-                (g.chistes.length ? `- Chistes internos y frases recurrentes: ${g.chistes.join(' | ')}` : '')
+                `MEMORIA DE FONDO (solo si el mensaje actual trata de esto; si no, ignórala y no la menciones):\n${recuerdos.join('\n')}`
             );
         }
 
         partes.push(
             `LA PERSONA QUE ESCRIBIÓ EL MENSAJE: ${nombreH}\n` +
-            (hablante.apodo
-                ? `- Le dices ${hablante.apodo}.\n`
-                : '- Todavía no sabes cómo prefiere que le digan.\n') +
-            `- Relación: ${descripcionCercania(hablante.cercania)}\n` +
-            (hablante.notas ? `- Cómo es tu relación con ella: ${hablante.notas}\n` : '') +
-            (hablante.hechos.length ? `- Lo que sabes de ella: ${hablante.hechos.slice(-12).join('; ')}` : '- Aún no sabes casi nada de ella.')
+            (hablante.apodo ? `- Le dices ${hablante.apodo}.\n` : '- Todavía no sabes cómo prefiere que le digan.\n') +
+            `- Relación: ${descripcionCercania(hablante.cercania ?? 10)}` +
+            (nota ? `\n- Sobre tu relación con ella: ${nota}` : '') +
+            (hechos.length ? `\n- Cosas que sabes de ella y que vienen al caso ahora (úsalas solo si ayudan a responder): ${hechos.join('; ')}` : '')
         );
-
-        if (otros.length) {
-            partes.push(
-                'OTRAS PERSONAS EN LA CHARLA:\n' +
-                otros.map((o) => `- ${etiquetas.get(o._id)}: ${o.hechos.slice(-4).join('; ') || 'sin datos'}`).join('\n')
-            );
-        }
 
         if (modo === 'directo' || modo === 'seguimiento') {
             partes.push(
@@ -362,19 +412,27 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             `ESTILO DE ESCRITURA (imita cómo escribe ${estiloDe}: su forma de escribir, no sus frases):\n${describirEstilo(estilo, muestras)}`
         );
 
-        const transcripcion = g.recientes
-            .slice(-CONTEXTO_MENSAJES)
+        if (propias.length) {
+            partes.push(
+                'NO REPITAS. Estos son tus últimos mensajes. Tu respuesta tiene que ser distinta en palabras, chiste, estructura y forma de empezar:\n' +
+                propias.map((t) => `- "${t}"`).join('\n')
+            );
+        }
+
+        const transcripcion = historial
             .map((m) => {
-                const quien = m.b ? 'SKYTEM' : etiquetas.get(m.j) || m.n || 'alguien';
-                return `${hace(m.ts)}${quien}${m.r ? ` (respondiendo a ${m.r})` : ''}: ${m.t}`;
+                const aQuien = m.b && m.p ? etiquetas.get(m.p) : '';
+                const quien = m.b ? `SKYTEM${aQuien ? ` (a ${aQuien})` : ''}` : etiquetas.get(m.j) || m.n || 'alguien';
+                return `${quien}${m.r ? ` (respondiendo a ${m.r})` : ''}: ${m.t}`;
             })
             .join('\n');
 
+        const quien = `${nombreH}${citaActual ? ` (respondiendo a ${citaActual})` : ''}`;
         let cierre;
         if (modo === 'espontaneo') {
-            cierre = 'Nadie te habló a ti. Mete un comentario solo si de verdad aporta algo (gracioso o útil) sobre lo último que se dijo. Si no, responde exactamente NO_RESPONDER.';
+            cierre = 'Nadie te habló a ti. Mete un comentario solo si está directamente relacionado con lo último que se dijo y de verdad aporta algo (gracioso o útil). Si dudas, responde exactamente NO_RESPONDER.';
         } else if (modo === 'ambiguo') {
-            cierre = `${nombreH} escribió: "${texto}"\nMencionó tu nombre, pero puede que no te hable a ti sino que hable de ti con otros. Si te habla a ti, responde. Si no, responde exactamente NO_RESPONDER.`;
+            cierre = `${quien} escribió: "${texto}"\nMencionó tu nombre, pero puede que no te hable a ti sino que hable de ti con otros. Si te habla a ti, responde. Si no, responde exactamente NO_RESPONDER.`;
         } else if (modo === 'seguimiento') {
             cierre = `Vienen teniendo una conversación seguida con ${nombreH} (varios mensajes de ida y vuelta) y acaba de escribir: "${texto}"\n` +
                 (otrosEnMedio
@@ -383,7 +441,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
                 'Responde solo si el mensaje continúa el hilo de lo que venían hablando o contesta a lo que dijiste. ' +
                 'Si es un saludo suelto, un tema nuevo que no tiene que ver, un acuse (ok, jaja) o suena a que le habla al grupo o a otra persona, responde exactamente NO_RESPONDER.';
         } else {
-            cierre = `${nombreH} te dice: "${texto}"\nResponde a ESE mensaje, con sentido y usando el contexto de arriba.`;
+            cierre = `${quien} te dice: "${texto}"\nResponde a ESE mensaje, con sentido y sobre ese mismo tema. No traigas temas de antes que no vengan al caso.`;
             if (esGrupo) cierre += ' Si es solo un acuse (ok, jaja, gracias, un sticker) y no hay nada que contestar, responde exactamente NO_RESPONDER.';
             if (preguntarNombre) {
                 cierre += `\nAún no sabes cómo prefiere que le digan a ${nombreH} (así aparece en WhatsApp). Solo si el momento es natural (un saludo o charla suelta), pregúntale cómo le dicen, corto y sin que suene a formulario. Si su mensaje es una pregunta o un tema concreto, respóndelo y no preguntes nada. Si en este mismo mensaje ya te dijo su nombre, no preguntes.`;
@@ -394,7 +452,9 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             { role: 'system', content: partes.join('\n\n') },
             {
                 role: 'user',
-                content: `Conversación reciente (lo más nuevo está abajo):\n${transcripcion}\n\n${cierre}\nEscribe SOLO el texto que enviarías, sin emojis. Si quieres mandar dos mensajes seguidos, sepáralos con un salto de línea (máximo 2).`
+                content: `Conversación reciente (lo más nuevo está abajo):\n${transcripcion || '(no hay mensajes previos recientes)'}\n\n${cierre}\n` +
+                    'Escribe SOLO el texto que enviarías, sin emojis. Antes de escribir comprueba que contesta directo a lo último que se dijo, que no repite tus mensajes anteriores y que no inventa nada. ' +
+                    'Si quieres mandar dos mensajes seguidos, sepáralos con un salto de línea (máximo 2).'
             }
         ];
     }
@@ -404,12 +464,25 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         const g = await getGrupo(chat);
         const hablante = await getPerfil(jid, nombre);
 
-        const ventana = g.recientes.slice(-CONTEXTO_MENSAJES).filter((m) => !m.b);
+        // Solo se lee lo reciente: lo viejo arrastra temas que ya no vienen al caso
+        const contexto = contextoReciente(g);
+        const ultimo = contexto[contexto.length - 1];
+        // el mensaje actual va aparte (en el cierre del prompt), no repetido dentro del historial
+        const actual = modo !== 'espontaneo' && ultimo && !ultimo.b && ultimo.j === jid ? ultimo : null;
+        const historial = actual ? contexto.slice(0, -1) : contexto;
+        const ventana = contexto.filter((m) => !m.b);
+
         const idsVentana = [...new Set([jid, ...ventana.map((m) => m.j)])].slice(0, 12);
         const etiquetas = await calcularEtiquetas(idsVentana);
 
-        const idsOtros = [...new Set(ventana.filter((m) => m.j !== jid).map((m) => m.j))].slice(0, 3);
-        const otros = await Promise.all(idsOtros.map((id) => getPerfil(id)));
+        // Lo último que dijo el bot para no repetirse. El chequeo en código mira los últimos 8 sin importar la edad
+        // (así detecta muletillas de hace horas), pero al modelo solo se le muestran los recientes (los viejos arrastran temas).
+        const propiasBot = g.recientes.filter((m) => m.b);
+        const propiasChequeo = propiasBot.slice(-8).map((m) => m.t);
+        const desdeVentana = Date.now() - VENTANA_MS;
+        const propias = propiasBot.filter((m) => (m.ts || 0) >= desdeVentana).slice(-ULTIMAS_PROPIAS).map((m) => m.t);
+        // y de qué se está hablando ahora (para elegir qué recuerdos sirven)
+        const referencia = [texto, ...historial.filter((m) => !m.b).slice(-2).map((m) => m.t)].join(' ');
 
         const seg = modo === 'seguimiento' ? await seguimiento(chat, jid) : null;
 
@@ -429,10 +502,35 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         const preguntarNombre = modo === 'directo' && !hablante.apodo && pn === 0;
 
         const mensajes = construirMensajes({
-            g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre,
-            estilo, muestras, estiloDe, otrosEnMedio: !!seg?.otrosEnMedio
+            g, hablante, jid, etiquetas, texto, modo, esGrupo, preguntarNombre,
+            estilo, muestras, estiloDe, otrosEnMedio: !!seg?.otrosEnMedio,
+            historial, citaActual: actual?.r || '', propias, referencia
         });
-        let bruto = String(await llm({ messages: mensajes, temperature: 0.8, maxTokens: 160 }) ?? '');
+
+        const pedir = async (aviso = '') => {
+            const msgs = aviso
+                ? [mensajes[0], { role: 'user', content: `${mensajes[1].content}\n\n${aviso}` }]
+                : mensajes;
+            return String(await llm({
+                messages: msgs,
+                temperature: aviso ? 0.85 : 0.6, // más bajo = más coherente
+                maxTokens: 220,
+                extra: PENALIZACIONES // castiga repetir palabras y frases
+            }) ?? '');
+        };
+        const sinEtiqueta = (b) => limpiarSalida(String(b).replace(/\[NOMBRE:[^\]\n]*\]/gi, ''));
+
+        let bruto = await pedir();
+
+        // Antirrepetición: si el borrador se parece a algo que ya dijo, se pide otro distinto
+        if (esRepetido(sinEtiqueta(bruto), propiasChequeo)) {
+            const previo = sinEtiqueta(bruto).slice(0, 100);
+            bruto = await pedir(
+                `Tu borrador ("${previo}") se parece demasiado a algo que ya dijiste. Escribe una respuesta distinta, con otras palabras y otra forma de empezar` +
+                (modo === 'directo' ? '.' : ', o responde exactamente NO_RESPONDER si no tienes nada nuevo que aportar.')
+            );
+            if (modo !== 'directo' && esRepetido(sinEtiqueta(bruto), propiasChequeo)) return []; // mejor callar que repetirse
+        }
 
         // Captura del nombre que la persona dice de sí misma (solo si aparece de verdad en su mensaje)
         let capturado = '';
@@ -499,10 +597,10 @@ Formato exacto:
 {"resumen":"...","chistes":["..."],"perfiles":{"<id>":{"apodo":"","hechos_nuevos":["..."],"notas":"...","cercania_delta":0}}}
 
 Reglas:
-- resumen: máximo 500 caracteres. De qué se ha hablado y la vibra del grupo. Fusiona con el resumen anterior sin repetirlo.
-- chistes: chistes internos, apodos, memes o frases recurrentes (máximo ${MAX_CHISTES} en total; conserva los anteriores que sigan vigentes).
-- hechos_nuevos: gustos, hobbies, juegos, estudios o trabajo en general, mascotas, manías, cosas que la persona dijo de sí misma. Solo hechos claros y duraderos, cada uno en menos de 12 palabras. Lista vacía si no hay nada nuevo.
-- notas: cómo es la relación de SKYTEM con esa persona y cómo habla (máximo 200 caracteres). Fusiona con la nota anterior.
+- resumen: máximo 300 caracteres. Solo de qué se habló en la conversación NUEVA. Los temas viejos que ya no aparecen se descartan; no acumules temas.
+- chistes: solo chistes internos, apodos o frases que se hayan repetido de verdad entre varias personas o varias veces (máximo ${MAX_CHISTES} en total). Descarta los anteriores que ya no se usen. Un chiste que se dijo una sola vez NO es recurrente.
+- hechos_nuevos: gustos, hobbies, juegos, estudios o trabajo en general, mascotas, manías, cosas que la persona dijo de sí misma. Solo rasgos claros y duraderos, cada uno en menos de 12 palabras. NO guardes temas puntuales de una charla (una tarea, un encargo o un proyecto concreto de hoy, un plan de esta semana, una duda del momento). Lista vacía si no hay nada nuevo.
+- notas: SOLO el tono de la relación de SKYTEM con esa persona (cómo se llevan, si bromean, si es seria), máximo 120 caracteres. NUNCA temas ni cosas de las que hablan.
 - cercania_delta: de -5 a 5 según cómo se llevó la persona con SKYTEM en esta conversación (0 si no interactuó con él).
 - NUNCA guardes contraseñas, teléfonos, direcciones, datos bancarios, salud, orientación sexual, religión, política ni datos de menores.
 - apodo: solo si la persona dijo claramente cómo quiere que la llamen. Si no, déjalo vacío. No inventes apodos.
@@ -526,7 +624,7 @@ Reglas:
                 return;
             }
 
-            if (typeof datos.resumen === 'string') g.resumen = limpiar(datos.resumen, 500);
+            if (typeof datos.resumen === 'string') g.resumen = limpiar(datos.resumen, 300);
             if (Array.isArray(datos.chistes)) {
                 g.chistes = datos.chistes
                     .map((c) => limpiar(c, 120))
@@ -552,7 +650,7 @@ Reglas:
                     if (p.hechos.length > MAX_HECHOS) p.hechos.splice(0, p.hechos.length - MAX_HECHOS);
                 }
 
-                const notas = limpiar(d.notas, 200);
+                const notas = limpiar(d.notas, 120);
                 if (notas && !SENSIBLE.test(notas)) p.notas = notas;
 
                 const delta = clamp(Number(d.cercania_delta) || 0, -5, 5);

@@ -74,6 +74,12 @@ const Grupo = mongoose.model('Grupo', new mongoose.Schema({
     desdeActualizacion: Number
 }, { versionKey: false }));
 
+// Ajustes por chat (por ahora: si SKYTEM puede hablar libremente)
+const Ajuste = mongoose.model('Ajuste', new mongoose.Schema({
+    _id: String,
+    libre: Boolean
+}, { versionKey: false }));
+
 // Sesión de WhatsApp guardada en MongoDB (una fila por clave)
 const AuthDoc = mongoose.model('BaileysAuth', new mongoose.Schema({
     _id: String,
@@ -188,7 +194,7 @@ const POLL_KEY = (process.env.POLLINATIONS_API_KEY || process.env.POLLINATIONS_K
     .replace(/^Bearer\s+/i, '')
     .trim();
 
-async function llm({ messages, temperature = 0.9, maxTokens = 200 }) {
+async function llm({ messages, temperature = 0.9, maxTokens = 200, extra = {} }) {
     const headers = { 'Content-Type': 'application/json' };
     if (POLL_KEY) {
         headers['Authorization'] = `Bearer ${POLL_KEY}`;
@@ -204,9 +210,16 @@ async function llm({ messages, temperature = 0.9, maxTokens = 200 }) {
         })
     });
 
-    let response = await pedir({ temperature, max_tokens: maxTokens });
-    // Algunos modelos rechazan temperature/max_tokens: se reintenta sin ellos
-    if (response.status === 400) response = await pedir({});
+    // Algunos modelos rechazan ciertos parámetros: se reintenta quitando primero las penalizaciones y luego todo
+    let response;
+    for (const cuerpo of [
+        { temperature, max_tokens: maxTokens, ...extra },
+        { temperature, max_tokens: maxTokens },
+        {}
+    ]) {
+        response = await pedir(cuerpo);
+        if (response.status !== 400) break;
+    }
 
     if (response.status === 401) {
         console.error(POLL_KEY
@@ -359,6 +372,31 @@ async function iniciarSocket() {
 const PROB_INTERVENCION = Number(process.env.INTERVENCION ?? 0);
 const NOMBRE_BOT = /\b(skytem|sky)\b/i;
 
+// HABLA LIBRE (se cambia con !libre on / !libre off, por chat)
+//  ON  = sigue la conversación, responde si dicen su nombre y (si INTERVENCION > 0) se mete solo.
+//  OFF = solo responde si lo mencionan, le responden a un mensaje suyo, escriben su nombre o usan !bot.
+// Valor inicial de los chats que nunca lo han tocado: HABLA_LIBRE=false en el .env lo deja apagado por defecto.
+const LIBRE_POR_DEFECTO = !/^(0|false|no|off)$/i.test(process.env.HABLA_LIBRE ?? 'true');
+const ajustesLibre = new Map();
+
+async function hablaLibre(chat) {
+    if (ajustesLibre.has(chat)) return ajustesLibre.get(chat);
+    try {
+        const a = await Ajuste.findById(chat).lean();
+        const valor = typeof a?.libre === 'boolean' ? a.libre : LIBRE_POR_DEFECTO;
+        ajustesLibre.set(chat, valor);
+        return valor;
+    } catch (e) {
+        console.error('Error leyendo ajuste de habla libre:', e.message);
+        return LIBRE_POR_DEFECTO;
+    }
+}
+
+async function fijarLibre(chat, valor) {
+    ajustesLibre.set(chat, valor);
+    await Ajuste.updateOne({ _id: chat }, { $set: { libre: valor } }, { upsert: true });
+}
+
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 const soloNumero = (j) => (j || '').split('@')[0].split(':')[0];
 
@@ -450,13 +488,17 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
     // directo: te hablan a ti · ambiguo: dijeron tu nombre, quizá no contigo · espontaneo: te metes solo
     // seguimiento: llevan una conversación seguida con SKYTEM (2+ turnos) y esta persona sigue sin citarlo ni mencionarlo
     const dirigidoAOtro = mencionaAOtro || respondeAOtro;
-    const seg = !dirigidoAOtro && esGrupo ? await memoria.seguimiento(chat, jid) : null;
+
+    // Con el habla libre apagada solo responde si lo llaman: mención, respuesta a un mensaje suyo, su nombre o !bot
+    const libre = await hablaLibre(chat);
+    const llamado = forzar || mencionaAlBot || respondeAlBot;
+    const seg = libre && !dirigidoAOtro && esGrupo ? await memoria.seguimiento(chat, jid) : null;
 
     let modo = null;
-    if (forzar || !esGrupo || mencionaAlBot || respondeAlBot) modo = 'directo';
+    if (llamado || (libre && !esGrupo)) modo = 'directo';
     else if (seg) modo = 'seguimiento';
     else if (NOMBRE_BOT.test(texto)) modo = 'ambiguo';
-    else if (!dirigidoAOtro && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION)) modo = 'espontaneo';
+    else if (libre && !dirigidoAOtro && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION)) modo = 'espontaneo';
     if (!modo) return;
 
     await enCola(chat, async () => {
@@ -625,12 +667,51 @@ async function manejarComando(sock, msg) {
             `• !ruleta opc1, opc2... - Elige una opción\n` +
             `• !8ball <pregunta> - Pregunta a la bola 8\n` +
             `• !moneda - Lanza una moneda\n` +
+            `• !libre on/off - Activa o desactiva que SKYTEM hable libremente (admins). Sin nada muestra el estado\n` +
             `• !perfil - Lo que SKYTEM sabe de ti\n` +
             `• !olvidame - Borra tu perfil\n` +
             `• !olvidargrupo - Borra la memoria del chat (admins)\n\n` +
             `*Acciones (usar con /):*\n• ` +
             Object.keys(ACCIONES).map((c) => '/' + c).join(', ');
         await responder(menu);
+        return;
+    }
+
+    // 2b. Habla libre: activar / desactivar
+    const cmdLibre = text.match(/^!(?:libre|hablar)(?:\s+(\S+))?\s*$/i);
+    if (cmdLibre) {
+        const arg = (cmdLibre[1] || '').toLowerCase();
+        const ON = ['on', 'si', 'sí', 'activar', 'activa', '1'];
+        const OFF = ['off', 'no', 'desactivar', 'desactiva', '0'];
+
+        if (!arg || arg === 'estado') {
+            const activo = await hablaLibre(jid);
+            await reaccionar('ℹ️');
+            await responder(
+                `Habla libre: *${activo ? 'ACTIVADA' : 'DESACTIVADA'}*\n` +
+                (activo
+                    ? 'Sigo la conversación, respondo si dicen mi nombre' + (PROB_INTERVENCION > 0 ? ' y a veces me meto solo.' : '.')
+                    : 'Solo respondo si me mencionan, me responden a un mensaje mío, escriben mi nombre o usan !bot.') +
+                '\n\nCambiar: !libre on / !libre off'
+            );
+            return;
+        }
+        if (!ON.includes(arg) && !OFF.includes(arg)) {
+            await reaccionar('❔');
+            await responder('Usa !libre on, !libre off o !libre estado');
+            return;
+        }
+        if (!(await esAdminOPrivado(sock, jid, remitente).catch(() => false))) {
+            await reaccionar('❌');
+            await responder('Solo admins pueden cambiar esto.');
+            return;
+        }
+        const nuevo = ON.includes(arg);
+        await fijarLibre(jid, nuevo);
+        await reaccionar('✅');
+        await responder(nuevo
+            ? 'listo, hablo libremente: sigo la conversación y respondo si dicen mi nombre'
+            : 'listo, modo callado: solo respondo si me mencionan, me responden un mensaje, escriben mi nombre o usan !bot');
         return;
     }
 
