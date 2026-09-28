@@ -139,6 +139,13 @@ async function startBot() {
             backupSyncIntervalMs: 300000
         }),
         ffmpegPath: ffmpegPath,
+        pairWithPhoneNumber: process.env.WHATSAPP_NUMBER
+            ? {
+                phoneNumber: process.env.WHATSAPP_NUMBER,
+                showNotification: true,
+                intervalMs: 180000
+            }
+            : undefined,
         puppeteer: {
             args: [
                 '--no-sandbox',
@@ -155,6 +162,12 @@ async function startBot() {
     client.on('qr', (qr) => {
         console.log('Escanea el código QR:');
         qrcode.generate(qr, { small: true });
+    });
+
+    client.on('code', (code) => {
+        console.log('=========================================');
+        console.log('CÓDIGO DE VINCULACIÓN:', code);
+        console.log('=========================================');
     });
 
     client.on('remote_session_saved', () => {
