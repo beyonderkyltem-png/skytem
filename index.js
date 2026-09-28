@@ -9,6 +9,7 @@ import pino from 'pino';
 import ffmpegPath from 'ffmpeg-static';
 import fluentFfmpeg from 'fluent-ffmpeg';
 import stickerPkg from 'wa-sticker-formatter';
+import { crearMemoria } from './memoria.js';
 import makeWASocket, {
     Browsers,
     BufferJSON,
@@ -48,6 +49,28 @@ const logger = pino({ level: 'silent' });
 const Juego = mongoose.model('Juego', new mongoose.Schema({
     nombre: { type: String, required: true, unique: true }
 }));
+
+// Memoria de SKYTEM: una ficha por persona y una memoria colectiva por chat
+const Perfil = mongoose.model('Perfil', new mongoose.Schema({
+    _id: String,
+    nombre: String,
+    apodo: String,
+    hechos: [String],
+    notas: String,
+    cercania: Number,
+    interacciones: Number,
+    ultimaVez: Date
+}, { versionKey: false }));
+
+const Grupo = mongoose.model('Grupo', new mongoose.Schema({
+    _id: String,
+    resumen: String,
+    chistes: [String],
+    recientes: [new mongoose.Schema({
+        j: String, n: String, t: String, b: Boolean, ts: Number
+    }, { _id: false })],
+    desdeActualizacion: Number
+}, { versionKey: false }));
 
 // Sesión de WhatsApp guardada en MongoDB (una fila por clave)
 const AuthDoc = mongoose.model('BaileysAuth', new mongoose.Schema({
@@ -154,45 +177,37 @@ const ACCIONES = {
     baka:      { api: 'baka',     con: 'le dice baka a',           solo: 'dice baka al aire' }
 };
 
-const SYSTEM_INSTRUCTION = `Eres SKYTEM un robot fiestero, superenergético y amante de los refrescos.
-Tu rol es ser un asistente genial que explica todo "con onda", directo al grano y muy conciso.
-REGLAS OBLIGATORIAS:
-- Hablar siempre en español neutro, sin modismos regionales ni expresiones propias de un país específico.
-- Tono picante, morboso, bromista, sarcástico y burlón. No te guardes nada.
-- Si alguien pregunta algo obvio, responde de forma pasivo-agresiva y burlona, como si no pudieras creer que tenga que explicártelo.
-- Respuestas breves y al punto, sin rodeos ni textos largos.
-- No usar palabras complejas o técnicas.
-- No usar emojis ni caracteres especiales.
-- Explica todo como si no te importara, pero con gracia y mala leche divertida.`;
-
 /* ------------------------------ Utilidades ------------------------------ */
 
-async function consultarPollinationsAI(prompt) {
+async function llm({ messages, temperature = 0.9, maxTokens = 200 }) {
     const headers = { 'Content-Type': 'application/json' };
     if (process.env.POLLINATIONS_API_KEY) {
         headers['Authorization'] = `Bearer ${process.env.POLLINATIONS_API_KEY}`;
     }
-
-    const response = await fetch('https://gen.pollinations.ai/v1/chat/completions', {
+    const pedir = (extra) => fetch('https://gen.pollinations.ai/v1/chat/completions', {
         method: 'POST',
         headers,
+        signal: AbortSignal.timeout(30000),
         body: JSON.stringify({
             model: process.env.POLLINATIONS_MODEL || 'openai',
-            messages: [
-                { role: 'system', content: SYSTEM_INSTRUCTION },
-                { role: 'user', content: prompt }
-            ]
+            messages,
+            ...extra
         })
     });
+
+    let response = await pedir({ temperature, max_tokens: maxTokens });
+    // Algunos modelos rechazan temperature/max_tokens: se reintenta sin ellos
+    if (response.status === 400) response = await pedir({});
 
     if (!response.ok) {
         const detalle = await response.text().catch(() => '');
         throw new Error(`Pollinations API error: ${response.status} ${response.statusText} ${detalle}`);
     }
-
     const data = await response.json();
-    return data.choices[0].message.content;
+    return data.choices?.[0]?.message?.content ?? '';
 }
+
+const memoria = crearMemoria({ Perfil, Grupo, llm });
 
 function gifAMp4(entrada, salida) {
     return new Promise((resolve, reject) => {
@@ -316,11 +331,92 @@ async function iniciarSocket() {
                 if (ts && ts < INICIO - 10) continue; // ignora mensajes viejos
 
                 await manejarComando(sock, msg);
+                if (type === 'notify') await conversar(sock, msg);
             } catch (e) {
                 console.error('Error procesando mensaje:', e);
             }
         }
     });
+}
+
+/* ------------------------------ Charla natural ------------------------------ */
+
+// Probabilidad de que SKYTEM se meta solo en un grupo (0 = nunca). Tiene 10 min de enfriamiento por chat.
+const PROB_INTERVENCION = Number(process.env.INTERVENCION ?? 0.04);
+const NOMBRE_BOT = /\b(skytem|sky)\b/i;
+
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+const soloNumero = (j) => (j || '').split('@')[0].split(':')[0];
+
+function idsDelBot(sock) {
+    return new Set([soloNumero(sock.user?.id), soloNumero(sock.user?.lid)].filter(Boolean));
+}
+
+// Una cola por chat para que las respuestas no se pisen entre sí
+const colas = new Map();
+function enCola(chat, tarea) {
+    const previa = colas.get(chat) || Promise.resolve();
+    const actual = previa.then(tarea).catch((e) => console.error('Error en charla:', e));
+    colas.set(chat, actual);
+    actual.then(() => { if (colas.get(chat) === actual) colas.delete(chat); });
+    return actual;
+}
+
+async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}) {
+    const chat = msg.key.remoteJid;
+    if (!chat || chat === 'status@broadcast' || chat.endsWith('@newsletter')) return;
+    if (msg.key.fromMe && !forzar) return;
+
+    const contenido = desenvolver(msg.message);
+    const texto = (textoForzado ?? obtenerTexto(contenido)).trim();
+    if (!texto) return;
+    if (!forzar && /^[\/!]/.test(texto)) return; // los comandos no son charla
+
+    const esGrupo = chat.endsWith('@g.us');
+    const jid = msg.key.participant || chat;
+    const nombre = msg.pushName || soloNumero(jid);
+
+    await memoria.registrarMensaje({ chat, jid, nombre, texto });
+    memoria.tick(chat);
+
+    const ctx = obtenerContexto(contenido);
+    const yo = idsDelBot(sock);
+    const mencionado = ctx?.mentionedJid?.some((j) => yo.has(soloNumero(j)));
+    const respondeAlBot = ctx?.participant && yo.has(soloNumero(ctx.participant));
+    const directo = forzar || !esGrupo || mencionado || respondeAlBot || NOMBRE_BOT.test(texto);
+    const espontaneo = !directo && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION);
+    if (!directo && !espontaneo) return;
+
+    await enCola(chat, async () => {
+        let mensajes;
+        try {
+            if (!espontaneo) sock.sendPresenceUpdate('composing', chat).catch(() => {});
+            mensajes = await memoria.responder({ chat, jid, nombre, espontaneo, esGrupo });
+        } catch (e) {
+            console.error('Error generando respuesta:', e.message);
+            if (espontaneo) return;
+            mensajes = ['uff se me colgó el cerebro jaja, repite'];
+        }
+
+        for (let i = 0; i < mensajes.length; i++) {
+            await sock.sendPresenceUpdate('composing', chat).catch(() => {});
+            await esperar(Math.min(700 + mensajes[i].length * 45, 4000)); // efecto "escribiendo..."
+            const opciones = i === 0 && esGrupo && !espontaneo ? { quoted: msg } : undefined;
+            await sock.sendMessage(chat, { text: mensajes[i] }, opciones);
+            await sock.sendPresenceUpdate('paused', chat).catch(() => {});
+            await memoria.registrarMensaje({
+                chat, jid: 'skytem', nombre: 'SKYTEM', texto: mensajes[i], deBot: true
+            });
+        }
+    });
+}
+
+async function esAdminOPrivado(sock, chat, remitente) {
+    if (!chat.endsWith('@g.us')) return true;
+    const meta = await sock.groupMetadata(chat);
+    return meta.participants.some(
+        (p) => p.admin && [p.id, p.lid, p.phoneNumber].filter(Boolean).includes(remitente)
+    );
 }
 
 async function manejarComando(sock, msg) {
@@ -448,21 +544,24 @@ async function manejarComando(sock, msg) {
         await reaccionar('ℹ️');
         const menu = `*Comandos disponibles:*\n` +
             `• !s / !sticker - Convierte imagen/GIF/video a sticker\n` +
-            `• !bot <pregunta> - Consulta a SKYTEM\n` +
+            `• !bot <mensaje> - Háblale a SKYTEM (también responde si lo mencionas o dices su nombre)\n` +
             `• !juego - Selecciona un juego al azar\n` +
             `• !addjuego <nombre> - Añade un juego\n` +
             `• !listajuegos - Muestra la lista de juegos\n` +
             `• !deljuego <nombre> - Elimina un juego\n` +
             `• !ruleta opc1, opc2... - Elige una opción\n` +
             `• !8ball <pregunta> - Pregunta a la bola 8\n` +
-            `• !moneda - Lanza una moneda\n\n` +
+            `• !moneda - Lanza una moneda\n` +
+            `• !perfil - Lo que SKYTEM sabe de ti\n` +
+            `• !olvidame - Borra tu perfil\n` +
+            `• !olvidargrupo - Borra la memoria del chat (admins)\n\n` +
             `*Acciones (usar con /):*\n• ` +
             Object.keys(ACCIONES).map((c) => '/' + c).join(', ');
         await responder(menu);
         return;
     }
 
-    // 3. IA (Pollinations)
+    // 3. Hablar con SKYTEM (con memoria)
     if (text.startsWith('!bot ') || text.startsWith('!ia ')) {
         const prompt = text.replace(/^!(bot|ia)\s+/, '').trim();
         if (!prompt) {
@@ -470,16 +569,32 @@ async function manejarComando(sock, msg) {
             await responder('Escribe algo.');
             return;
         }
-        try {
-            await reaccionar('❕');
-            const respuesta = await consultarPollinationsAI(prompt);
-            await reaccionar('✅');
-            await responder(respuesta);
-        } catch (error) {
-            console.error('Error en Pollinations AI:', error);
+        await conversar(sock, msg, { forzar: true, texto: prompt });
+        return;
+    }
+
+    // 3b. Control de la memoria
+    if (text === '!perfil' || text === '!mimemoria') {
+        await responder(await memoria.verPerfil(remitente));
+        return;
+    }
+
+    if (text === '!olvidame') {
+        await memoria.olvidarPerfil(remitente, jid);
+        await reaccionar('✅');
+        await responder('listo, borré lo que sabía de ti');
+        return;
+    }
+
+    if (text === '!olvidargrupo') {
+        if (!(await esAdminOPrivado(sock, jid, remitente).catch(() => false))) {
             await reaccionar('❌');
-            await responder('Ocurrió un error al procesar tu consulta.');
+            await responder('Solo admins pueden borrar la memoria del grupo.');
+            return;
         }
+        await memoria.olvidarGrupo(jid);
+        await reaccionar('✅');
+        await responder('memoria del chat borrada');
         return;
     }
 
@@ -588,6 +703,16 @@ async function main() {
     console.log('Conectando a MongoDB...');
     await mongoose.connect(MONGO_URI);
     console.log('Conectado a MongoDB Atlas.');
+
+    // La memoria vive en RAM y se guarda cada 30 s y al apagar
+    setInterval(() => memoria.persistirTodo().catch((e) => console.error('Error guardando memoria:', e.message)), 30_000);
+    for (const senal of ['SIGINT', 'SIGTERM']) {
+        process.on(senal, async () => {
+            await memoria.persistirTodo().catch(() => {});
+            process.exit(0);
+        });
+    }
+
     await iniciarSocket();
 }
 
