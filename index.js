@@ -59,6 +59,7 @@ const Perfil = mongoose.model('Perfil', new mongoose.Schema({
     notas: String,
     cercania: Number,
     interacciones: Number,
+    preguntasNombre: Number,
     ultimaVez: Date
 }, { versionKey: false }));
 

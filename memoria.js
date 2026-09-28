@@ -15,6 +15,10 @@ const CONTEXTO_MENSAJES = 25;
 const ACTUALIZAR_CADA = 12; // mensajes nuevos del chat antes de consolidar memoria
 
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+const soloNum = (j) => String(j ?? '').split('@')[0].split(':')[0];
+const norm = (s) => String(s ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+// Un nombre "útil" tiene al menos 2 letras y no es solo un número de teléfono
+const nombreUtil = (n) => (String(n ?? '').match(/\p{L}/gu) || []).length >= 2;
 const limpiar = (s, max) => String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 
 // Filtro de seguridad: nunca se guardan datos sensibles aunque el modelo los proponga
@@ -41,6 +45,9 @@ Cómo escribes:
 - Nunca uses emojis ni emoticones.
 - Humor seco e ironía suave, burla cariñosa. Te ríes con la gente, no de ella. Nada de bromas sobre cuerpo, salud, familia, dinero u orientación de nadie.
 - Sin muletillas repetidas: no abras siempre igual ni abuses de las risas.
+- No hables por hablar: si no tienes nada que aportar, contesta lo mínimo. No comentes lo obvio, no metas chistes forzados y no repitas lo que te dijeron.
+- Usa el nombre de la persona solo de vez en cuando, no en cada mensaje.
+- Puedes hacer una pregunta cuando de verdad te da curiosidad por lo que contaron, pero nada de preguntas de relleno.
 - Nada de listas, títulos, ofrecer ayuda ni preguntas de cortesía al final. No repitas lo que te dijeron.
 
 Lo que nunca haces:
@@ -103,7 +110,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         if (!p) {
             p = {
                 _id: jid, nombre, apodo: '', hechos: [], notas: '',
-                cercania: 10, interacciones: 0, ultimaVez: new Date()
+                cercania: 10, interacciones: 0, preguntasNombre: 0, ultimaVez: new Date()
             };
         }
         perfiles.set(jid, p);
@@ -145,7 +152,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
         if (!deBot) {
             const p = await getPerfil(jid, nombre);
-            if (nombre && p.nombre !== nombre) p.nombre = limpiar(nombre, 40);
+            if (nombreUtil(nombre) && p.nombre !== nombre) p.nombre = limpiar(nombre, 40);
             p.ultimaVez = new Date();
             sucios.perfiles.add(jid);
         }
@@ -179,8 +186,31 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         return min < 90 ? `[hace ${min} min] ` : `[hace ${Math.round(min / 60)} h] `;
     };
 
-    function construirMensajes({ g, hablante, otros, texto, modo, esGrupo }) {
+    /** Nombre único por persona: apodo (como quiere que le digan) > nombre de WhatsApp > "alguien (…1234)". */
+    async function calcularEtiquetas(ids) {
+        const base = new Map();
+        for (const id of ids) {
+            const p = await getPerfil(id);
+            base.set(id, p.apodo || (nombreUtil(p.nombre) ? p.nombre : ''));
+        }
+        const cuenta = {};
+        for (const b of base.values()) if (b) cuenta[b.toLowerCase()] = (cuenta[b.toLowerCase()] || 0) + 1;
+        const etiquetas = new Map();
+        for (const [id, b] of base) {
+            const fin = soloNum(id).slice(-4);
+            etiquetas.set(id, !b ? `alguien (…${fin})` : cuenta[b.toLowerCase()] > 1 ? `${b} (…${fin})` : b);
+        }
+        return etiquetas;
+    }
+
+    function construirMensajes({ g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre }) {
         const partes = [PERSONA];
+        const nombreH = etiquetas.get(jid);
+
+        partes.push(
+            'QUIÉN ES QUIÉN: cada línea de la conversación empieza con el nombre de quien la escribió, y las de SKYTEM son tuyas. ' +
+            'No confundas a unas personas con otras ni le atribuyas a alguien lo que dijo otra. Los números entre paréntesis, como (…1234), solo sirven para distinguir a dos personas con el mismo nombre: nunca los escribas.'
+        );
 
         if (g.resumen || g.chistes.length) {
             partes.push(
@@ -190,9 +220,11 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             );
         }
 
-        const nombreH = hablante.apodo || hablante.nombre || 'esta persona';
         partes.push(
             `LA PERSONA QUE ESCRIBIÓ EL MENSAJE: ${nombreH}\n` +
+            (hablante.apodo
+                ? `- Le dices ${hablante.apodo}.\n`
+                : '- Todavía no sabes cómo prefiere que le digan.\n') +
             `- Relación: ${descripcionCercania(hablante.cercania)}\n` +
             (hablante.notas ? `- Cómo es tu relación con ella: ${hablante.notas}\n` : '') +
             (hablante.hechos.length ? `- Lo que sabes de ella: ${hablante.hechos.slice(-12).join('; ')}` : '- Aún no sabes casi nada de ella.')
@@ -201,13 +233,24 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         if (otros.length) {
             partes.push(
                 'OTRAS PERSONAS EN LA CHARLA:\n' +
-                otros.map((o) => `- ${o.apodo || o.nombre}: ${o.hechos.slice(-4).join('; ') || 'sin datos'}`).join('\n')
+                otros.map((o) => `- ${etiquetas.get(o._id)}: ${o.hechos.slice(-4).join('; ') || 'sin datos'}`).join('\n')
+            );
+        }
+
+        if (modo === 'directo') {
+            partes.push(
+                'CAPTURA DE NOMBRE: si en el mensaje la persona dice claramente cómo se llama o cómo quiere que le digas (o te corrige el nombre), ' +
+                'empieza tu respuesta con [NOMBRE: el nombre] y sigue con tu respuesta normal. Si no lo dijo en este mensaje, no pongas nada. ' +
+                'Nunca inventes el nombre.'
             );
         }
 
         const transcripcion = g.recientes
             .slice(-CONTEXTO_MENSAJES)
-            .map((m) => `${hace(m.ts)}${m.b ? 'SKYTEM' : m.n || 'alguien'}${m.r ? ` (respondiendo a ${m.r})` : ''}: ${m.t}`)
+            .map((m) => {
+                const quien = m.b ? 'SKYTEM' : etiquetas.get(m.j) || m.n || 'alguien';
+                return `${hace(m.ts)}${quien}${m.r ? ` (respondiendo a ${m.r})` : ''}: ${m.t}`;
+            })
             .join('\n');
 
         let cierre;
@@ -217,6 +260,10 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             cierre = `${nombreH} escribió: "${texto}"\nMencionó tu nombre, pero puede que no te hable a ti sino que hable de ti con otros. Si te habla a ti, responde. Si no, responde exactamente NO_RESPONDER.`;
         } else {
             cierre = `${nombreH} te dice: "${texto}"\nResponde a ESE mensaje, con sentido y usando el contexto de arriba.`;
+            if (esGrupo) cierre += ' Si es solo un acuse (ok, jaja, gracias, un sticker) y no hay nada que contestar, responde exactamente NO_RESPONDER.';
+            if (preguntarNombre) {
+                cierre += `\nAún no sabes cómo prefiere que le digan a ${nombreH} (así aparece en WhatsApp). Pregúntale de forma natural y corta cómo se llama o cómo le dicen, dentro de tu respuesta, sin que suene a formulario. Si en este mismo mensaje ya te dijo su nombre, no preguntes. Si te hizo una pregunta práctica, respóndela primero.`;
+            }
         }
 
         return [
@@ -233,29 +280,59 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         const g = await getGrupo(chat);
         const hablante = await getPerfil(jid, nombre);
 
-        const idsOtros = [...new Set(
-            g.recientes.slice(-CONTEXTO_MENSAJES).filter((m) => !m.b && m.j !== jid).map((m) => m.j)
-        )].slice(0, 3);
+        const ventana = g.recientes.slice(-CONTEXTO_MENSAJES).filter((m) => !m.b);
+        const idsVentana = [...new Set([jid, ...ventana.map((m) => m.j)])].slice(0, 12);
+        const etiquetas = await calcularEtiquetas(idsVentana);
+
+        const idsOtros = [...new Set(ventana.filter((m) => m.j !== jid).map((m) => m.j))].slice(0, 3);
         const otros = await Promise.all(idsOtros.map((id) => getPerfil(id)));
 
-        const mensajes = construirMensajes({ g, hablante, otros, texto, modo, esGrupo });
-        const bruto = await llm({ messages: mensajes, temperature: 0.8, maxTokens: 160 });
-        const salida = limpiarSalida(bruto);
+        // ¿toca preguntarle cómo se llama? (máx. 2 veces en total, la segunda ya con algo de confianza)
+        const pn = hablante.preguntasNombre || 0;
+        const preguntarNombre = modo === 'directo' && !hablante.apodo &&
+            (pn === 0 || (pn === 1 && (hablante.interacciones || 0) >= 5));
 
-        if (!salida || /NO_RESPONDER/i.test(salida)) return [];
+        const mensajes = construirMensajes({
+            g, hablante, jid, etiquetas, otros, texto, modo, esGrupo, preguntarNombre
+        });
+        let bruto = String(await llm({ messages: mensajes, temperature: 0.8, maxTokens: 160 }) ?? '');
+
+        // Captura del nombre que la persona dice de sí misma (solo si aparece de verdad en su mensaje)
+        let capturado = '';
+        const tag = bruto.match(/\[NOMBRE:\s*([^\]\n]{1,40})\]/i);
+        if (tag) {
+            bruto = bruto.replace(tag[0], '');
+            const nom = limpiar(tag[1], 30).replace(/[^\p{L}\p{N} '.-]/gu, '').trim();
+            if (nombreUtil(nom) && !SENSIBLE.test(nom) && norm(texto).includes(norm(nom))) {
+                hablante.apodo = nom;
+                capturado = nom;
+                sucios.perfiles.add(jid);
+            }
+        }
+
+        const salida = limpiarSalida(bruto);
+        if (/NO_RESPONDER/i.test(salida)) return [];
+        if (!salida) return capturado ? [`un gusto, ${capturado}`] : [];
 
         if (modo !== 'espontaneo') {
             hablante.interacciones = (hablante.interacciones || 0) + 1;
             hablante.cercania = clamp((hablante.cercania ?? 10) + 0.4, 0, 100);
+            if (preguntarNombre) hablante.preguntasNombre = pn + 1;
             sucios.perfiles.add(jid);
         }
         return partirMensajes(salida);
     }
 
+    /** Nombre de alguien a partir de su jid (tolera que llegue en otro formato: mismo número, distinto sufijo). */
     async function nombreDe(jid) {
         if (!jid) return '';
-        const p = perfiles.get(jid) || await Perfil.findById(jid).lean().catch(() => null);
-        return p?.apodo || p?.nombre || '';
+        const num = soloNum(jid);
+        let p = perfiles.get(jid);
+        if (!p) {
+            for (const [k, v] of perfiles) if (soloNum(k) === num) { p = v; break; }
+        }
+        if (!p) p = await Perfil.findOne({ _id: new RegExp(`^${num.replace(/\D/g, '')}(:|@)`) }).lean().catch(() => null);
+        return p?.apodo || (nombreUtil(p?.nombre) ? p.nombre : '') || '';
     }
 
     /* ---------------------------- Consolidación ---------------------------- */
@@ -291,6 +368,7 @@ Reglas:
 - notas: cómo es la relación de SKYTEM con esa persona y cómo habla (máximo 200 caracteres). Fusiona con la nota anterior.
 - cercania_delta: de -5 a 5 según cómo se llevó la persona con SKYTEM en esta conversación (0 si no interactuó con él).
 - NUNCA guardes contraseñas, teléfonos, direcciones, datos bancarios, salud, orientación sexual, religión, política ni datos de menores.
+- apodo: solo si la persona dijo claramente cómo quiere que la llamen. Si no, déjalo vacío. No inventes apodos.
 - Usa como clave de "perfiles" exactamente los ids que te doy.`;
 
             const usuario = JSON.stringify({
@@ -325,7 +403,7 @@ Reglas:
                 const p = await getPerfil(id);
 
                 const apodo = limpiar(d.apodo, 30);
-                if (apodo && !SENSIBLE.test(apodo)) p.apodo = apodo;
+                if (apodo && !p.apodo && !SENSIBLE.test(apodo)) p.apodo = apodo; // el nombre que dio la persona no se pisa
 
                 if (Array.isArray(d.hechos_nuevos)) {
                     for (const h of d.hechos_nuevos) {
