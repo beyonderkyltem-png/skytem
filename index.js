@@ -1,4 +1,16 @@
 require('dotenv').config();
+
+process.on('unhandledRejection', (reason) => {
+    console.error('Promesa rechazada sin manejar:', reason);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Excepción sin capturar:', err);
+});
+
+require('http')
+    .createServer((req, res) => res.end('SKYTEM activo'))
+    .listen(process.env.PORT || 3000);
+
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -154,7 +166,14 @@ async function startBot() {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--mute-audio',
+                '--renderer-process-limit=1',
+                '--js-flags=--max-old-space-size=256'
             ]
         }
     });
@@ -439,7 +458,9 @@ async function startBot() {
         }
     });
 
-    client.initialize();
+    client.initialize().catch((err) => {
+        console.error('Error al inicializar el cliente:', err);
+    });
 }
 
 startBot();
