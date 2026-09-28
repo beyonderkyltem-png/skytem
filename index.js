@@ -148,7 +148,7 @@ async function startBot() {
         authStrategy: new RemoteAuth({
             clientId: 'skytem',
             store: store,
-            backupSyncIntervalMs: 300000
+            backupSyncIntervalMs: 60000
         }),
         ffmpegPath: ffmpegPath,
         pairWithPhoneNumber: process.env.WHATSAPP_NUMBER
@@ -189,16 +189,13 @@ async function startBot() {
         console.log('=========================================');
     });
 
-    client.on('remote_session_saved', () => {
-        console.log('Sesión guardada en MongoDB.');
-    });
-
-    client.on('authenticated', () => console.log('Autenticado.'));
-    client.on('auth_failure', (m) => console.error('Fallo de autenticación:', m));
-
-    client.on('ready', () => {
-        console.log('SKYTEM activo con IA ilimitada.');
-    });
+    client.on('authenticated', () => console.log('[AUTH] Autenticado'));
+    client.on('auth_failure', (m) => console.error('[AUTH] Fallo:', m));
+    client.on('loading_screen', (p, m) => console.log('[LOAD]', p + '%', m));
+    client.on('change_state', (s) => console.log('[STATE]', s));
+    client.on('disconnected', (r) => console.log('[DESCONECTADO]', r));
+    client.on('ready', () => console.log('[READY] Cliente listo'));
+    client.on('remote_session_saved', () => console.log('[SESIÓN] Guardada en MongoDB'));
 
     async function handleCommand(message) {
         const text = message.body.trim();
