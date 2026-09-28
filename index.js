@@ -370,7 +370,7 @@ async function iniciarSocket() {
 
 // Probabilidad de que SKYTEM se meta solo en un grupo (0 = nunca, por defecto). Tiene 10 min de enfriamiento por chat.
 const PROB_INTERVENCION = Number(process.env.INTERVENCION ?? 0);
-const NOMBRE_BOT = /\b(skytem|sky)\b/i;
+const NOMBRE_BOT = /\bskytem\b|^\s*sky\b/i; // "sky" solo si abre el mensaje ("sky, ...")
 
 // HABLA LIBRE (se cambia con !libre on / !libre off, por chat)
 //  ON  = sigue la conversación, responde si dicen su nombre y (si INTERVENCION > 0) se mete solo.

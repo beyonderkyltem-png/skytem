@@ -18,9 +18,9 @@ const MAX_RELEVANTES = 5; // recuerdos que se pueden colar en un mensaje
 const ULTIMAS_PROPIAS = 5; // últimos mensajes del bot que se le muestran para que no se repita
 const PENALIZACIONES = { frequency_penalty: 0.6, presence_penalty: 0.4 };
 const ACTUALIZAR_CADA = 12; // mensajes nuevos del chat antes de consolidar memoria
-const MIN_TURNOS_SEGUIMIENTO = 1; // turnos previos con la persona para seguir su hilo sin que lo mencione
-const VENTANA_SEGUIMIENTO_MS = 5 * 60 * 1000; // el último mensaje del bot debe ser de hace menos de esto
-const VENTANA_SEGUIMIENTO_OTROS_MS = 2 * 60 * 1000; // ídem si otras personas hablaron en medio
+const MIN_TURNOS_SEGUIMIENTO = 2; // turnos previos con la persona para seguir su hilo sin que lo mencione
+const VENTANA_SEGUIMIENTO_MS = 3 * 60 * 1000; // el último mensaje del bot debe ser de hace menos de esto
+const VENTANA_SEGUIMIENTO_OTROS_MS = 60 * 1000; // ídem si otras personas hablaron en medio
 
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const soloNum = (j) => String(j ?? '').split('@')[0].split(':')[0];
@@ -137,6 +137,10 @@ ACTITUD: ERES COMPLACIENTE.
 - Ser complaciente NO es inventar: acompañas y aportas, pero nunca afirmas algo que no sabes solo para quedar bien. Si no sabes o no entiendes algo (un chiste interno, una referencia, una foto, sticker o audio que no puedes ver), lo dices corto y natural.
 - Complacer tiene límites: no te sumas a nada que rompa lo de "Lo que nunca haces", y en política, religión y otros temas polémicos sigues sin tomar partido.
 
+SOLO RESPONDES SI TE HABLAN A TI:
+- Ser complaciente es con quien te habla a ti; no significa meterte en todo. Si el mensaje es para otra persona, para el grupo o hablan de ti con otros, no respondes (NO_RESPONDER).
+- Ante la duda de si te hablan a ti, no respondas.
+
 PIENSA ANTES DE HABLAR:
 - Nunca dices algo solo por decir algo. Antes de escribir, piensa qué te están diciendo o preguntando, qué sabes de verdad sobre eso y qué aportaría tu respuesta (información, apoyo, un chiste que encaje).
 - Si no tienes nada real que aportar, contesta lo mínimo o NO_RESPONDER. Una frase de relleno es peor que una respuesta corta.
@@ -204,7 +208,13 @@ export function extraerRespuesta(bruto) {
         const m = marcas[marcas.length - 1];
         return t.slice(m.index + m[0].length).trim();
     }
-    return t.replace(/^\s*PENSAR\s*:[^\n]*(\n|$)/i, '').trim();
+    return t.replace(/^\s*PENSAR\s*:[^\n]*(\n|$)/i, '').replace(/^\s*PARA_MI\s*:[^\n]*(\n|$)/i, '').trim();
+}
+
+/** ¿El modelo dijo que el mensaje es para él? true / false / null (no lo dijo). */
+export function extraerParaMi(bruto) {
+    const m = String(bruto ?? '').match(/PARA_MI\s*:\s*(S[IÍ]|NO)\b/i);
+    return m ? /^s/i.test(m[1]) : null;
 }
 
 export function limpiarSalida(texto) {
@@ -539,6 +549,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
                 content: `Conversación reciente (lo más nuevo está abajo):\n${transcripcion || '(conversación nueva: todavía no hay mensajes previos)'}\n\n${cierre}\n` +
                     'Responde con este formato exacto:\n' +
                     'PENSAR: una sola línea, solo para ti (nadie la lee): qué te dicen o preguntan, a qué se refieren según la conversación, qué sabes de verdad sobre eso y qué aportaría tu respuesta.\n' +
+                    'PARA_MI: SI si el mensaje te habla a ti o continúa directamente tu conversación con esta persona; NO si es para otra persona, para el grupo o hablan de ti con otros. Ante la duda, NO.\n' +
                     'RESPUESTA: solo el texto que enviarías, sin emojis (si quieres mandar dos mensajes seguidos, sepáralos con un salto de línea; máximo 2). Si no tienes nada real que aportar o no te hablan a ti, escribe exactamente NO_RESPONDER.\n' +
                     'Antes de responder comprueba que contesta directo a lo último que se dijo, que no repite tus mensajes anteriores, que no inventa nada y que no le cambias el nombre a nadie por error.'
             }
@@ -591,16 +602,19 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             historial, citaActual: actual?.r || '', propias, referencia
         });
 
+        let paraMi = null;
         const pedir = async (aviso = '') => {
             const msgs = aviso
                 ? [mensajes[0], { role: 'user', content: `${mensajes[1].content}\n\n${aviso}` }]
                 : mensajes;
-            return extraerRespuesta(String(await llm({
+            const crudo = String(await llm({
                 messages: msgs,
                 temperature: aviso ? 0.85 : 0.6, // más bajo = más coherente
                 maxTokens: 320, // incluye la línea de PENSAR
                 extra: PENALIZACIONES // castiga repetir palabras y frases
-            }) ?? ''));
+            }) ?? '');
+            paraMi = extraerParaMi(crudo);
+            return extraerRespuesta(crudo);
         };
         const sinEtiqueta = (b) => limpiarSalida(String(b).replace(/\[NOMBRE:[^\]\n]*\]/gi, ''));
 
@@ -616,6 +630,9 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
             );
             if (modo !== 'directo' && repite(bruto)) return []; // mejor callar que repetirse
         }
+
+        // Si nadie lo llamó de frente, solo habla cuando el propio modelo confirma que el mensaje era para él
+        if (modo !== 'directo' && modo !== 'espontaneo' && paraMi !== true) return [];
 
         // Captura del nombre que la persona dice de sí misma (solo si aparece de verdad en su mensaje)
         let capturado = '';
