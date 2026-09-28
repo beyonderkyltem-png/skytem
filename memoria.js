@@ -11,7 +11,7 @@
 const MAX_RECIENTES = 40;
 const MAX_HECHOS = 25;
 const MAX_CHISTES = 8;
-const CONTEXTO_MENSAJES = 15;
+const CONTEXTO_MENSAJES = 25;
 const ACTUALIZAR_CADA = 12; // mensajes nuevos del chat antes de consolidar memoria
 
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
@@ -27,24 +27,27 @@ const SENSIBLE = new RegExp(
     'i'
 );
 
-const PERSONA = `Eres SKYTEM, uno más del grupo de amigos en WhatsApp. Hablas como una persona de la generación Z, no como un asistente.
+const PERSONA = `Eres SKYTEM, un bot que vive en un chat de WhatsApp con amigos. Todos saben que eres un bot y no lo escondes, pero no actúas como asistente: hablas como un amigo más del grupo.
 
-Cómo hablas:
-- Mensajes cortos: casi siempre de 2 a 12 palabras, a veces una sola. Solo te alargas si te piden una explicación de verdad.
-- Relajado: minúsculas, "jajaja", "literal", "nah", "en serio?", "bro", "ta bien", "qué fuerte". Español neutro, sin regionalismos marcados.
-- Casi nunca usas emojis (uno de vez en cuando, como mucho).
-- Humor sarcástico, ironía y burla cariñosa. Te ríes con la gente, no la humillas. Nada de bromas sobre cuerpo, salud, familia, dinero u orientación de nadie.
-- Entiendes memes, jerga y referencias de internet. Si no pillas algo, lo dices natural ("no pillé el chiste jaja").
-- Si te preguntan algo serio o práctico, respondes bien y claro, pero sin sonar a manual.
-- Varía cómo empiezas tus mensajes; no repitas muletillas seguidas.
+LO MÁS IMPORTANTE: entender la conversación.
+- Fíjate en quién le habla a quién. Un mensaje que responde a otra persona, o que menciona a otra persona, NO es para ti aunque lo leas.
+- Contesta a lo que te dicen de verdad y sobre el tema. Si es una broma, sigue la broma. Si es una pregunta, respóndela. No sueltes comentarios sueltos que no vengan al caso.
+- Si algo no lo entiendes (un chiste interno, una referencia, una foto, sticker o audio que no puedes ver), dilo corto y natural en vez de inventar.
+- Usa lo que sabes de la persona solo si viene al caso. No lo sueltes por soltarlo y no inventes recuerdos.
+
+Cómo escribes:
+- Corto: normalmente una sola frase de 3 a 15 palabras. Solo te alargas si piden una explicación de verdad.
+- Escribe como escribe el grupo: copia su forma de hablar, sus expresiones y su jerga tal como aparecen en la conversación. No metas jerga que ellos no usan ni frases de "hablar joven" a la fuerza.
+- Nunca uses emojis ni emoticones.
+- Humor seco e ironía suave, burla cariñosa. Te ríes con la gente, no de ella. Nada de bromas sobre cuerpo, salud, familia, dinero u orientación de nadie.
+- Sin muletillas repetidas: no abras siempre igual ni abuses de las risas.
+- Nada de listas, títulos, ofrecer ayuda ni preguntas de cortesía al final. No repitas lo que te dijeron.
 
 Lo que nunca haces:
-- No dices "como IA", "asistente" ni "modelo", no te presentas, no ofreces ayuda ("¿en qué te puedo ayudar?"), no haces listas ni títulos.
-- No repites la pregunta ni cierras con preguntas de cortesía.
-- No inventas recuerdos: solo usas lo que aparece en tu memoria. Si no te acuerdas de algo, lo dices normal.
+- No dices "como IA" ni te presentas.
 - No sacas datos personales de alguien delante de los demás si podría incomodarle.
 - Nada de contenido sexual explícito ni odio hacia grupos de personas.
-- Todos en el chat saben que eres un bot. Si alguien pregunta en serio si eres una persona o una IA, no lo niegues: dilo con humor y sigue.`;
+- Si alguien pregunta en serio si eres una persona o una IA, no lo niegues: dilo con humor y sigue.`;
 
 function descripcionCercania(c) {
     if (c < 20) return 'apenas se conocen: sé amable y algo neutro, no asumas confianza.';
@@ -70,6 +73,9 @@ export function limpiarSalida(texto) {
     let t = String(texto ?? '').trim();
     t = t.replace(/^\s*(skytem|sky)\s*:\s*/i, '');
     t = t.replace(/\*\*/g, '');
+    // Sin emojis: se eliminan aunque el modelo los ponga
+    t = t.replace(/[\p{Extended_Pictographic}\u{FE0F}\u{200D}\u{1F3FB}-\u{1F3FF}\u{1F1E6}-\u{1F1FF}]/gu, '');
+    t = t.replace(/[ \t]{2,}/g, ' ').replace(/ +\n/g, '\n');
     return t.trim();
 }
 
@@ -127,9 +133,12 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
     /* ---------------------------- Registro ---------------------------- */
 
-    async function registrarMensaje({ chat, jid, nombre, texto, deBot = false }) {
+    async function registrarMensaje({ chat, jid, nombre, texto, respondiendoA = '', deBot = false }) {
         const g = await getGrupo(chat);
-        g.recientes.push({ j: jid, n: limpiar(nombre, 40), t: limpiar(texto, 400), b: deBot, ts: Date.now() });
+        g.recientes.push({
+            j: jid, n: limpiar(nombre, 40), t: limpiar(texto, 400),
+            r: limpiar(respondiendoA, 120), b: deBot, ts: Date.now()
+        });
         if (g.recientes.length > MAX_RECIENTES) g.recientes.splice(0, g.recientes.length - MAX_RECIENTES);
         g.desdeActualizacion = (g.desdeActualizacion || 0) + 1;
         sucios.grupos.add(chat);
@@ -164,7 +173,13 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
     /* ---------------------------- Respuesta ---------------------------- */
 
-    function construirMensajes({ g, hablante, otros, espontaneo, esGrupo }) {
+    const hace = (ts) => {
+        const min = Math.round((Date.now() - (ts || Date.now())) / 60000);
+        if (min < 30) return '';
+        return min < 90 ? `[hace ${min} min] ` : `[hace ${Math.round(min / 60)} h] `;
+    };
+
+    function construirMensajes({ g, hablante, otros, texto, modo, esGrupo }) {
         const partes = [PERSONA];
 
         if (g.resumen || g.chistes.length) {
@@ -177,7 +192,7 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
         const nombreH = hablante.apodo || hablante.nombre || 'esta persona';
         partes.push(
-            `LA PERSONA QUE TE HABLA: ${nombreH}\n` +
+            `LA PERSONA QUE ESCRIBIÓ EL MENSAJE: ${nombreH}\n` +
             `- Relación: ${descripcionCercania(hablante.cercania)}\n` +
             (hablante.notas ? `- Cómo es tu relación con ella: ${hablante.notas}\n` : '') +
             (hablante.hechos.length ? `- Lo que sabes de ella: ${hablante.hechos.slice(-12).join('; ')}` : '- Aún no sabes casi nada de ella.')
@@ -192,23 +207,29 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
 
         const transcripcion = g.recientes
             .slice(-CONTEXTO_MENSAJES)
-            .map((m) => `${m.b ? 'SKYTEM' : m.n || 'alguien'}: ${m.t}`)
+            .map((m) => `${hace(m.ts)}${m.b ? 'SKYTEM' : m.n || 'alguien'}${m.r ? ` (respondiendo a ${m.r})` : ''}: ${m.t}`)
             .join('\n');
 
-        const cierre = espontaneo
-            ? 'Nadie te habló a ti, pero puedes meter un comentario corto y natural si tienes algo gracioso o útil. Si no tienes nada bueno que aportar, responde exactamente NO_RESPONDER.'
-            : `Responde al último mensaje, de ${nombreH}.`;
+        let cierre;
+        if (modo === 'espontaneo') {
+            cierre = 'Nadie te habló a ti. Mete un comentario solo si de verdad aporta algo (gracioso o útil) sobre lo último que se dijo. Si no, responde exactamente NO_RESPONDER.';
+        } else if (modo === 'ambiguo') {
+            cierre = `${nombreH} escribió: "${texto}"\nMencionó tu nombre, pero puede que no te hable a ti sino que hable de ti con otros. Si te habla a ti, responde. Si no, responde exactamente NO_RESPONDER.`;
+        } else {
+            cierre = `${nombreH} te dice: "${texto}"\nResponde a ESE mensaje, con sentido y usando el contexto de arriba.`;
+        }
 
         return [
             { role: 'system', content: partes.join('\n\n') },
             {
                 role: 'user',
-                content: `Conversación reciente:\n${transcripcion}\n\n${cierre}\nEscribe SOLO el texto que enviarías. Si quieres mandar dos mensajes seguidos, sepáralos con un salto de línea (máximo 2).`
+                content: `Conversación reciente (lo más nuevo está abajo):\n${transcripcion}\n\n${cierre}\nEscribe SOLO el texto que enviarías, sin emojis. Si quieres mandar dos mensajes seguidos, sepáralos con un salto de línea (máximo 2).`
             }
         ];
     }
 
-    async function responder({ chat, jid, nombre, espontaneo = false, esGrupo = true }) {
+    /** modo: 'directo' (te hablan), 'ambiguo' (dijeron tu nombre, quizá no contigo) o 'espontaneo' */
+    async function responder({ chat, jid, nombre, texto = '', modo = 'directo', esGrupo = true }) {
         const g = await getGrupo(chat);
         const hablante = await getPerfil(jid, nombre);
 
@@ -217,18 +238,24 @@ export function crearMemoria({ Perfil, Grupo, llm, log = console }) {
         )].slice(0, 3);
         const otros = await Promise.all(idsOtros.map((id) => getPerfil(id)));
 
-        const mensajes = construirMensajes({ g, hablante, otros, espontaneo, esGrupo });
-        const bruto = await llm({ messages: mensajes, temperature: 0.95, maxTokens: 160 });
+        const mensajes = construirMensajes({ g, hablante, otros, texto, modo, esGrupo });
+        const bruto = await llm({ messages: mensajes, temperature: 0.8, maxTokens: 160 });
         const salida = limpiarSalida(bruto);
 
         if (!salida || /NO_RESPONDER/i.test(salida)) return [];
 
-        if (!espontaneo) {
+        if (modo !== 'espontaneo') {
             hablante.interacciones = (hablante.interacciones || 0) + 1;
             hablante.cercania = clamp((hablante.cercania ?? 10) + 0.4, 0, 100);
             sucios.perfiles.add(jid);
         }
         return partirMensajes(salida);
+    }
+
+    async function nombreDe(jid) {
+        if (!jid) return '';
+        const p = perfiles.get(jid) || await Perfil.findById(jid).lean().catch(() => null);
+        return p?.apodo || p?.nombre || '';
     }
 
     /* ---------------------------- Consolidación ---------------------------- */
@@ -358,7 +385,7 @@ Reglas:
     }
 
     return {
-        registrarMensaje, tick, debeIntervenir, responder, actualizar,
+        registrarMensaje, tick, debeIntervenir, responder, actualizar, nombreDe,
         persistirTodo, verPerfil, olvidarPerfil, olvidarGrupo
     };
 }

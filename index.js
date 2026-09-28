@@ -67,7 +67,7 @@ const Grupo = mongoose.model('Grupo', new mongoose.Schema({
     resumen: String,
     chistes: [String],
     recientes: [new mongoose.Schema({
-        j: String, n: String, t: String, b: Boolean, ts: Number
+        j: String, n: String, t: String, r: String, b: Boolean, ts: Number
     }, { _id: false })],
     desdeActualizacion: Number
 }, { versionKey: false }));
@@ -341,8 +341,8 @@ async function iniciarSocket() {
 
 /* ------------------------------ Charla natural ------------------------------ */
 
-// Probabilidad de que SKYTEM se meta solo en un grupo (0 = nunca). Tiene 10 min de enfriamiento por chat.
-const PROB_INTERVENCION = Number(process.env.INTERVENCION ?? 0.04);
+// Probabilidad de que SKYTEM se meta solo en un grupo (0 = nunca, por defecto). Tiene 10 min de enfriamiento por chat.
+const PROB_INTERVENCION = Number(process.env.INTERVENCION ?? 0);
 const NOMBRE_BOT = /\b(skytem|sky)\b/i;
 
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -362,46 +362,96 @@ function enCola(chat, tarea) {
     return actual;
 }
 
+function tipoMedia(m) {
+    if (m.stickerMessage) return '[sticker]';
+    if (m.imageMessage) return '[foto]';
+    if (m.videoMessage) return m.videoMessage.gifPlayback ? '[gif]' : '[video]';
+    if (m.audioMessage) return m.audioMessage.ptt ? '[nota de voz]' : '[audio]';
+    if (m.documentMessage) return '[archivo]';
+    if (m.locationMessage || m.liveLocationMessage) return '[ubicación]';
+    if (m.contactMessage || m.contactsArrayMessage) return '[contacto]';
+    if (m.pollCreationMessage || m.pollCreationMessageV2 || m.pollCreationMessageV3) return '[encuesta]';
+    return '';
+}
+
+// Texto + marca de multimedia, para que la memoria no tenga huecos cuando mandan fotos, stickers o audios
+function descripcionMensaje(m) {
+    const t = obtenerTexto(m).trim();
+    const media = tipoMedia(m);
+    return media ? `${media} ${t}`.trim() : t;
+}
+
+// Cambia "@5491234..." por el nombre de la persona mencionada
+async function textoLegible(texto, ctx, yo) {
+    let t = texto;
+    for (const j of ctx?.mentionedJid || []) {
+        const num = soloNumero(j);
+        const nom = yo.has(num) ? 'SKYTEM' : (await memoria.nombreDe(j)) || 'alguien';
+        t = t.split(`@${num}`).join(`@${nom}`);
+    }
+    return t;
+}
+
 async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}) {
     const chat = msg.key.remoteJid;
     if (!chat || chat === 'status@broadcast' || chat.endsWith('@newsletter')) return;
     if (msg.key.fromMe && !forzar) return;
 
     const contenido = desenvolver(msg.message);
-    const texto = (textoForzado ?? obtenerTexto(contenido)).trim();
+    const crudo = (textoForzado ?? obtenerTexto(contenido)).trim();
+    if (!forzar && /^[\/!]/.test(crudo)) return; // los comandos no son charla
+
+    let texto = (textoForzado ?? descripcionMensaje(contenido)).trim();
     if (!texto) return;
-    if (!forzar && /^[\/!]/.test(texto)) return; // los comandos no son charla
 
     const esGrupo = chat.endsWith('@g.us');
     const jid = msg.key.participant || chat;
     const nombre = msg.pushName || soloNumero(jid);
 
-    await memoria.registrarMensaje({ chat, jid, nombre, texto });
-    memoria.tick(chat);
-
     const ctx = obtenerContexto(contenido);
     const yo = idsDelBot(sock);
-    const mencionado = ctx?.mentionedJid?.some((j) => yo.has(soloNumero(j)));
+    texto = await textoLegible(texto, ctx, yo);
+
+    // A quién le está respondiendo (si cita un mensaje)
+    let respondiendoA = '';
+    if (ctx?.quotedMessage) {
+        const autor = yo.has(soloNumero(ctx.participant))
+            ? 'SKYTEM'
+            : (await memoria.nombreDe(ctx.participant)) || 'alguien';
+        const citado = descripcionMensaje(desenvolver(ctx.quotedMessage)).slice(0, 80);
+        respondiendoA = citado ? `${autor}: "${citado}"` : autor;
+    }
+
+    await memoria.registrarMensaje({ chat, jid, nombre, texto, respondiendoA });
+    memoria.tick(chat);
+
+    const mencionaAlBot = ctx?.mentionedJid?.some((j) => yo.has(soloNumero(j)));
     const respondeAlBot = ctx?.participant && yo.has(soloNumero(ctx.participant));
-    const directo = forzar || !esGrupo || mencionado || respondeAlBot || NOMBRE_BOT.test(texto);
-    const espontaneo = !directo && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION);
-    if (!directo && !espontaneo) return;
+    const mencionaAOtro = ctx?.mentionedJid?.some((j) => !yo.has(soloNumero(j)));
+    const respondeAOtro = ctx?.participant && !respondeAlBot;
+
+    // directo: te hablan a ti · ambiguo: dijeron tu nombre, quizá no contigo · espontaneo: te metes solo
+    let modo = null;
+    if (forzar || !esGrupo || mencionaAlBot || respondeAlBot) modo = 'directo';
+    else if (NOMBRE_BOT.test(texto)) modo = 'ambiguo';
+    else if (!mencionaAOtro && !respondeAOtro && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION)) modo = 'espontaneo';
+    if (!modo) return;
 
     await enCola(chat, async () => {
         let mensajes;
         try {
-            if (!espontaneo) sock.sendPresenceUpdate('composing', chat).catch(() => {});
-            mensajes = await memoria.responder({ chat, jid, nombre, espontaneo, esGrupo });
+            if (modo === 'directo') sock.sendPresenceUpdate('composing', chat).catch(() => {});
+            mensajes = await memoria.responder({ chat, jid, nombre, texto, modo, esGrupo });
         } catch (e) {
             console.error('Error generando respuesta:', e.message);
-            if (espontaneo) return;
+            if (modo !== 'directo') return;
             mensajes = ['uff se me colgó el cerebro jaja, repite'];
         }
 
         for (let i = 0; i < mensajes.length; i++) {
             await sock.sendPresenceUpdate('composing', chat).catch(() => {});
             await esperar(Math.min(700 + mensajes[i].length * 45, 4000)); // efecto "escribiendo..."
-            const opciones = i === 0 && esGrupo && !espontaneo ? { quoted: msg } : undefined;
+            const opciones = i === 0 && esGrupo && modo !== 'espontaneo' ? { quoted: msg } : undefined;
             await sock.sendMessage(chat, { text: mensajes[i] }, opciones);
             await sock.sendPresenceUpdate('paused', chat).catch(() => {});
             await memoria.registrarMensaje({
