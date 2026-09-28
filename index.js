@@ -378,6 +378,7 @@ const NOMBRE_BOT = /\b(skytem|sky)\b/i;
 // Valor inicial de los chats que nunca lo han tocado: HABLA_LIBRE=false en el .env lo deja apagado por defecto.
 const LIBRE_POR_DEFECTO = !/^(0|false|no|off)$/i.test(process.env.HABLA_LIBRE ?? 'true');
 const ajustesLibre = new Map();
+const pendientesBorrado = new Map(); // confirmaciones de !borrartodo (60 s)
 
 async function hablaLibre(chat) {
     if (ajustesLibre.has(chat)) return ajustesLibre.get(chat);
@@ -526,20 +527,50 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
     });
 }
 
-async function esAdminOPrivado(sock, chat, remitente) {
+// Dueño(s) del bot: DUENOS=18091234567,18097654321 en el .env. Además, todo lo que se escriba desde el propio número del bot cuenta como del dueño.
+const DUENOS = (process.env.DUENOS || process.env.OWNER_NUMBER || '')
+    .split(/[,\s]+/).map((n) => n.replace(/\D/g, '')).filter(Boolean);
+const esDueno = (msg, remitente) => !!msg?.key?.fromMe || DUENOS.includes(soloNumero(remitente));
+
+// Compara por NÚMERO (sin sufijos de dispositivo/servidor) y acepta id, lid y número: WhatsApp los mezcla según el grupo.
+// Si no se puede leer la lista de admins, lanza error (el que llama lo distingue de "no eres admin").
+async function esAdminOPrivado(sock, chat, remitente, msg) {
     if (!chat.endsWith('@g.us')) return true;
+    if (esDueno(msg, remitente)) return true;
     const meta = await sock.groupMetadata(chat);
+    const yo = new Set([remitente, msg?.key?.participantAlt].map(soloNumero).filter(Boolean));
     return meta.participants.some(
-        (p) => p.admin && [p.id, p.lid, p.phoneNumber].filter(Boolean).includes(remitente)
+        (p) => p.admin && [p.id, p.lid, p.phoneNumber].filter(Boolean).some((x) => yo.has(soloNumero(x)))
     );
 }
+
+// Menú: para quitar un comando del menú, añade su nombre a OCULTOS_DEL_MENU (las acciones con "/", ej. '/golpear').
+// Ocultarlo del menú NO lo desactiva: sigue funcionando.
+const OCULTOS_DEL_MENU = new Set(['olvidargrupo']);
+const MENU = [
+    ['s', '• !s / !sticker - Convierte imagen/GIF/video a sticker'],
+    ['bot', '• !bot <mensaje> - Háblale a SKYTEM (también responde si lo mencionas o dices su nombre)'],
+    ['juego', '• !juego - Selecciona un juego al azar'],
+    ['addjuego', '• !addjuego <nombre> - Añade un juego'],
+    ['listajuegos', '• !listajuegos - Muestra la lista de juegos'],
+    ['deljuego', '• !deljuego <nombre> - Elimina un juego'],
+    ['ruleta', '• !ruleta opc1, opc2... - Elige una opción'],
+    ['8ball', '• !8ball <pregunta> - Pregunta a la bola 8'],
+    ['moneda', '• !moneda - Lanza una moneda'],
+    ['libre', '• !libre on/off - Activa o desactiva que SKYTEM hable libremente (admins). Sin nada muestra el estado'],
+    ['perfil', '• !perfil - Lo que SKYTEM sabe de ti'],
+    ['olvidame', '• !olvidame - Borra tu perfil y tus mensajes guardados'],
+    ['olvidargrupo', '• !olvidargrupo - Borra solo la memoria del chat (admins)'],
+    ['borrartodo', '• !borrartodo - Borra TODA la memoria del chat y las fichas de sus miembros, con confirmación (admins)']
+];
 
 async function manejarComando(sock, msg) {
     const jid = msg.key.remoteJid;
     if (!jid || jid === 'status@broadcast') return;
 
     const contenido = desenvolver(msg.message);
-    const text = obtenerTexto(contenido).trim();
+    // Tolera "! perfil" o "!Perfil" (el teclado suele meter espacio o mayúscula)
+    const text = obtenerTexto(contenido).trim().replace(/^!\s*(\S+)/, (_, c) => `!${c.toLowerCase()}`);
     if (!text.startsWith('/') && !text.startsWith('!')) return;
 
     const reaccionar = (emoji) =>
@@ -550,6 +581,20 @@ async function manejarComando(sock, msg) {
     const remitente = msg.key.participant || msg.key.remoteJid;
     const nombreDe = msg.pushName || remitente.split('@')[0];
     const contexto = obtenerContexto(contenido);
+
+    // Verifica admin y responde con el motivo correcto (antes un fallo al leer el grupo se veía como "no eres admin")
+    const exigirAdmin = async (mensajeNo) => {
+        try {
+            if (await esAdminOPrivado(sock, jid, remitente, msg)) return true;
+            await reaccionar('❌');
+            await responder(mensajeNo);
+        } catch (e) {
+            console.error('No se pudo verificar admin:', e.message);
+            await reaccionar('❌');
+            await responder('No pude verificar si eres admin (WhatsApp no me dio la lista del grupo). Intenta de nuevo en unos segundos.');
+        }
+        return false;
+    };
 
     /* ----- Acciones anime ----- */
     if (text.startsWith('/')) {
@@ -657,22 +702,10 @@ async function manejarComando(sock, msg) {
     // 2. Ayuda
     if (text === '!ayuda' || text === '!help') {
         await reaccionar('ℹ️');
+        const acciones = Object.keys(ACCIONES).filter((c) => !OCULTOS_DEL_MENU.has('/' + c)).map((c) => '/' + c);
         const menu = `*Comandos disponibles:*\n` +
-            `• !s / !sticker - Convierte imagen/GIF/video a sticker\n` +
-            `• !bot <mensaje> - Háblale a SKYTEM (también responde si lo mencionas o dices su nombre)\n` +
-            `• !juego - Selecciona un juego al azar\n` +
-            `• !addjuego <nombre> - Añade un juego\n` +
-            `• !listajuegos - Muestra la lista de juegos\n` +
-            `• !deljuego <nombre> - Elimina un juego\n` +
-            `• !ruleta opc1, opc2... - Elige una opción\n` +
-            `• !8ball <pregunta> - Pregunta a la bola 8\n` +
-            `• !moneda - Lanza una moneda\n` +
-            `• !libre on/off - Activa o desactiva que SKYTEM hable libremente (admins). Sin nada muestra el estado\n` +
-            `• !perfil - Lo que SKYTEM sabe de ti\n` +
-            `• !olvidame - Borra tu perfil\n` +
-            `• !olvidargrupo - Borra la memoria del chat (admins)\n\n` +
-            `*Acciones (usar con /):*\n• ` +
-            Object.keys(ACCIONES).map((c) => '/' + c).join(', ');
+            MENU.filter(([id]) => !OCULTOS_DEL_MENU.has(id)).map(([, t]) => t).join('\n') +
+            (acciones.length ? `\n\n*Acciones (usar con /):*\n• ${acciones.join(', ')}` : '');
         await responder(menu);
         return;
     }
@@ -701,11 +734,7 @@ async function manejarComando(sock, msg) {
             await responder('Usa !libre on, !libre off o !libre estado');
             return;
         }
-        if (!(await esAdminOPrivado(sock, jid, remitente).catch(() => false))) {
-            await reaccionar('❌');
-            await responder('Solo admins pueden cambiar esto.');
-            return;
-        }
+        if (!(await exigirAdmin('Solo admins pueden cambiar esto.'))) return;
         const nuevo = ON.includes(arg);
         await fijarLibre(jid, nuevo);
         await reaccionar('✅');
@@ -734,21 +763,81 @@ async function manejarComando(sock, msg) {
     }
 
     if (text === '!olvidame') {
-        await memoria.olvidarPerfil(remitente, jid);
+        await memoria.olvidarPerfil([remitente, msg.key.participantAlt, msg.key.remoteJidAlt].filter(Boolean));
         await reaccionar('✅');
-        await responder('listo, borré lo que sabía de ti');
+        await responder('listo, borré lo que sabía de ti y tus mensajes guardados en todos los chats');
         return;
     }
 
     if (text === '!olvidargrupo') {
-        if (!(await esAdminOPrivado(sock, jid, remitente).catch(() => false))) {
-            await reaccionar('❌');
-            await responder('Solo admins pueden borrar la memoria del grupo.');
-            return;
-        }
+        if (!(await exigirAdmin('Solo admins pueden borrar la memoria del grupo.'))) return;
         await memoria.olvidarGrupo(jid);
         await reaccionar('✅');
-        await responder('memoria del chat borrada');
+        await responder('memoria del chat borrada (las fichas de las personas siguen; para borrarlo todo usa !borrartodo)');
+        return;
+    }
+
+    // 3c. Borrar TODO, con confirmación (60 s)
+    //   !borrartodo          -> memoria del chat + fichas de sus miembros (admins)
+    //   !borrartodo global   -> toda la memoria de todos los chats (solo dueño)
+    const cmdBorrar = text.match(/^!borrartodo(?:\s+(global))?(?:\s+(confirmar))?\s*$/i);
+    if (cmdBorrar) {
+        const global = !!cmdBorrar[1];
+        const confirma = !!cmdBorrar[2];
+        const clave = `${jid}|${soloNumero(remitente)}|${global ? 'g' : 'c'}`;
+
+        if (global) {
+            if (!esDueno(msg, remitente)) {
+                await reaccionar('❌');
+                await responder(DUENOS.length
+                    ? 'Solo el dueño del bot puede borrar todo de forma global.'
+                    : 'Para el borrado global define DUENOS en el .env (tu número con código de país, solo dígitos) o escríbelo desde el número del bot.');
+                return;
+            }
+        } else if (!(await exigirAdmin('Solo admins pueden borrar la memoria del chat.'))) {
+            return;
+        }
+
+        if (!confirma) {
+            pendientesBorrado.set(clave, Date.now());
+            await reaccionar('⚠️');
+            await responder(global
+                ? 'Esto borra TODA la memoria de SKYTEM en TODOS los chats (todas las fichas y todos los resúmenes). No toca la sesión de WhatsApp, la lista de juegos ni el ajuste !libre.\n\nPara confirmar escribe *!borrartodo global confirmar* (vale 60 s).'
+                : 'Esto borra TODA la memoria de este chat (resumen, chistes y mensajes guardados) y las fichas de las personas del chat, incluido lo que sé de ellas en otros chats. No toca la lista de juegos ni el ajuste !libre.\n\nPara confirmar escribe *!borrartodo confirmar* (vale 60 s).');
+            return;
+        }
+
+        const t = pendientesBorrado.get(clave);
+        pendientesBorrado.delete(clave);
+        if (!t || Date.now() - t > 60_000) {
+            await reaccionar('❔');
+            await responder(`No hay un borrado pendiente (o pasó más de 1 minuto). Escribe primero *!borrartodo${global ? ' global' : ''}*`);
+            return;
+        }
+
+        try {
+            await reaccionar('❕');
+            if (global) {
+                const r = await memoria.olvidarTodo();
+                await reaccionar('✅');
+                await responder(`listo, borré todo: ${r.perfiles} fichas y la memoria de ${r.chats} chats`);
+            } else {
+                const ids = [];
+                if (jid.endsWith('@g.us')) {
+                    const meta = await sock.groupMetadata(jid).catch(() => null);
+                    for (const p of meta?.participants || []) ids.push(p.id, p.lid, p.phoneNumber);
+                } else {
+                    ids.push(jid);
+                }
+                const r = await memoria.olvidarChat(jid, ids);
+                await reaccionar('✅');
+                await responder(`listo, borré la memoria del chat y ${r.perfiles} fichas de personas`);
+            }
+        } catch (e) {
+            console.error('Error en !borrartodo:', e);
+            await reaccionar('❌');
+            await responder('Algo falló al borrar, intenta de nuevo.');
+        }
         return;
     }
 
