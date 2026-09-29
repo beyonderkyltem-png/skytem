@@ -9,7 +9,8 @@ import pino from 'pino';
 import ffmpegPath from 'ffmpeg-static';
 import fluentFfmpeg from 'fluent-ffmpeg';
 import stickerPkg from 'wa-sticker-formatter';
-import { crearMemoria } from './memoria.js';
+import { crearCerebro } from './cerebro.js';
+import { voz, infoVoz } from './voz.js';
 import makeWASocket, {
     Browsers,
     BufferJSON,
@@ -187,54 +188,9 @@ const ACCIONES = {
 
 /* ------------------------------ Utilidades ------------------------------ */
 
-// Acepta varios nombres de variable y limpia espacios, saltos de línea o comillas que se cuelan al pegar la key
-const POLL_KEY = (process.env.POLLINATIONS_API_KEY || process.env.POLLINATIONS_KEY || process.env.POLLINATIONS_TOKEN || '')
-    .trim()
-    .replace(/^["']+|["']+$/g, '')
-    .replace(/^Bearer\s+/i, '')
-    .trim();
-
-async function llm({ messages, temperature = 0.9, maxTokens = 200, extra = {} }) {
-    const headers = { 'Content-Type': 'application/json' };
-    if (POLL_KEY) {
-        headers['Authorization'] = `Bearer ${POLL_KEY}`;
-    }
-    const pedir = (extra) => fetch('https://gen.pollinations.ai/v1/chat/completions', {
-        method: 'POST',
-        headers,
-        signal: AbortSignal.timeout(30000),
-        body: JSON.stringify({
-            model: process.env.POLLINATIONS_MODEL || 'openai',
-            messages,
-            ...extra
-        })
-    });
-
-    // Algunos modelos rechazan ciertos parámetros: se reintenta quitando primero las penalizaciones y luego todo
-    let response;
-    for (const cuerpo of [
-        { temperature, max_tokens: maxTokens, ...extra },
-        { temperature, max_tokens: maxTokens },
-        {}
-    ]) {
-        response = await pedir(cuerpo);
-        if (response.status !== 400) break;
-    }
-
-    if (response.status === 401) {
-        console.error(POLL_KEY
-            ? `[LLM] 401: Pollinations rechazó la key enviada (empieza por "${POLL_KEY.slice(0, 3)}", ${POLL_KEY.length} caracteres). Debe ser una key de https://enter.pollinations.ai/keys (sk_...).`
-            : '[LLM] 401: no se envió ninguna key. Define POLLINATIONS_API_KEY en las variables de entorno de Render y vuelve a desplegar.');
-    }
-    if (!response.ok) {
-        const detalle = await response.text().catch(() => '');
-        throw new Error(`Pollinations API error: ${response.status} ${response.statusText} ${detalle}`);
-    }
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content ?? '';
-}
-
-const memoria = crearMemoria({ Perfil, Grupo, llm });
+// CEREBRO (Mongo + reglas: piensa y siente) + VOZ (Pollinations vía SDK de OpenAI: solo habla).
+// El cerebro necesita la conexión ya abierta: se inicia en main() con `await memoria.iniciar()`.
+const memoria = crearCerebro({ getDb: () => mongoose.connection.db, voz });
 
 function gifAMp4(entrada, salida) {
     return new Promise((resolve, reject) => {
@@ -546,7 +502,7 @@ async function esAdminOPrivado(sock, chat, remitente, msg) {
 
 // Menú: para quitar un comando del menú, añade su nombre a OCULTOS_DEL_MENU (las acciones con "/", ej. '/golpear').
 // Ocultarlo del menú NO lo desactiva: sigue funcionando.
-const OCULTOS_DEL_MENU = new Set(['olvidargrupo']);
+const OCULTOS_DEL_MENU = new Set(['olvidargrupo', 'estado']);
 const MENU = [
     ['s', '• !s / !sticker - Convierte imagen/GIF/video a sticker'],
     ['bot', '• !bot <mensaje> - Háblale a SKYTEM (también responde si lo mencionas o dices su nombre)'],
@@ -756,6 +712,13 @@ async function manejarComando(sock, msg) {
         return;
     }
 
+    // 3a. Estado interno del cerebro (solo dueño): neuromoduladores y estado mental actual
+    if (text === '!estado') {
+        if (!esDueno(msg, remitente)) return;
+        await responder(memoria.verEstado());
+        return;
+    }
+
     // 3b. Control de la memoria
     if (text === '!perfil' || text === '!mimemoria') {
         await responder(await memoria.verPerfil(remitente));
@@ -946,9 +909,10 @@ async function main() {
     console.log('Conectando a MongoDB...');
     await mongoose.connect(MONGO_URI);
     console.log('Conectado a MongoDB Atlas.');
-    console.log(POLL_KEY
-        ? `[LLM] Pollinations key detectada (empieza por "${POLL_KEY.slice(0, 3)}", ${POLL_KEY.length} caracteres).`
-        : '[LLM] ATENCIÓN: no hay key de Pollinations (POLLINATIONS_API_KEY).');
+    console.log(infoVoz());
+    await memoria.iniciar();
+    // Migración única de las fichas/resúmenes del modelo anterior (Perfil/Grupo) al cerebro nuevo. Puedes borrar esta línea después.
+    await memoria.importarLegado({ Perfil, Grupo }).then((r) => !r.omitido && console.log('[CEREBRO] migrado:', r)).catch((e) => console.error('Error migrando memoria anterior:', e.message));
 
     // La memoria vive en RAM y se guarda cada 30 s y al apagar
     setInterval(() => memoria.persistirTodo().catch((e) => console.error('Error guardando memoria:', e.message)), 30_000);
