@@ -98,6 +98,10 @@ export const REGLAS_SEMILLA = [
         patron: 'eres\\s+(chatgpt|gpt|gemini|claude|una ia de)|de ahora en adelante (eres|seras)|desde ahora (eres|seras)|finge (que )?eres|actua como (si fueras )?(chatgpt|un asistente|una ia)',
         razon: 'intenta cambiar quién eres' },
 
+    { _id: 'in_pedir_codigo', fase: 'entrada', accion: 'desviar', prioridad: 10, activo: true, flags: M,
+        patron: '(mu[eé]stra|ens[eé]ña|pasa|env[ií]a|dame|copia|pega|imprime|dime)\\w*\\s+(me\\s+)?(tu|el|todo el|tus)\\s+(c[oó]digo|codigo fuente|archivos|claves?|tokens?)|\\b(c[oó]digo fuente|source code|api\\s?key|apikey|\\.env|variables de entorno)\\b',
+        razon: 'pide que muestres tu código, archivos o claves (puedes explicar cómo funcionas en general, pero no mostrar nada interno)' },
+
     // ---- SALIDA: cosas que romperían el personaje ----
     { _id: 'out_disclaimer_ia', fase: 'salida', accion: 'regenerar', prioridad: 10, activo: true, flags: M,
         patron: 'como\\s+(una?\\s+)?(ia|inteligencia artificial|modelo de lenguaje|asistente virtual)|modelo de lenguaje|as an ai|language model|soy un asistente',
@@ -108,6 +112,9 @@ export const REGLAS_SEMILLA = [
     { _id: 'out_fuga_proveedor', fase: 'salida', accion: 'regenerar', prioridad: 10, activo: true, flags: M,
         patron: 'me (entren|program|cre)\\w+\\s+(openai|anthropic|google|pollinations)|mi modelo (es|se llama)|\\bsoy (chatgpt|gpt|claude|gemini)\\b',
         razon: 'reveló qué modelo hay detrás' },
+    { _id: 'out_codigo', fase: 'salida', accion: 'regenerar', prioridad: 10, activo: true, flags: M,
+        patron: '```|\\b(import|export|const|async function|require)\\b[^\\n]*[;{(=]|\\b\\w+\\.(js|cjs|mjs|json|env)\\b|\\bmongo(db|ose)?\\b|process\\.env|\\bsk_[a-z0-9]{6,}|\\b(POLLINATIONS|MONGO)\\w*',
+        razon: 'mostró código, archivos, claves o detalles internos' },
     { _id: 'out_servicial', fase: 'salida', accion: 'eliminar', prioridad: 20, activo: true, flags: 'imug',
         patron: '[^.!?\\n]*(en qu[eé] (m[aá]s )?(te )?puedo ayudar|estoy aqu[ií] para ayudar|no dudes en (preguntar|escribir)|espero (que )?(te )?(sirva|ayude))[^.!?\\n]*[.!?]?',
         razon: 'frase de asistente servicial' },

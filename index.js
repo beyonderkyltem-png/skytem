@@ -446,15 +446,15 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
     // seguimiento: llevan una conversación seguida con SKYTEM (2+ turnos) y esta persona sigue sin citarlo ni mencionarlo
     const dirigidoAOtro = mencionaAOtro || respondeAOtro;
 
-    // Con el habla libre apagada solo responde si lo llaman: mención, respuesta a un mensaje suyo, su nombre o !bot
+    // Con el habla libre apagada SOLO responde a !bot / !ia (ni menciones, ni respuestas a sus mensajes, ni su nombre)
     const libre = await hablaLibre(chat);
-    const llamado = forzar || mencionaAlBot || respondeAlBot;
+    const llamado = forzar || (libre && (mencionaAlBot || respondeAlBot));
     const seg = libre && !dirigidoAOtro && esGrupo ? await memoria.seguimiento(chat, jid) : null;
 
     let modo = null;
     if (llamado || (libre && !esGrupo)) modo = 'directo';
     else if (seg) modo = 'seguimiento';
-    else if (NOMBRE_BOT.test(texto)) modo = 'ambiguo';
+    else if (libre && NOMBRE_BOT.test(texto)) modo = 'ambiguo';
     else if (libre && !dirigidoAOtro && memoria.debeIntervenir(chat, texto, PROB_INTERVENCION)) modo = 'espontaneo';
     if (!modo) return;
 
@@ -680,7 +680,7 @@ async function manejarComando(sock, msg) {
                 `Habla libre: *${activo ? 'ACTIVADA' : 'DESACTIVADA'}*\n` +
                 (activo
                     ? 'Sigo la conversación, respondo si dicen mi nombre' + (PROB_INTERVENCION > 0 ? ' y a veces me meto solo.' : '.')
-                    : 'Solo respondo si me mencionan, me responden a un mensaje mío, escriben mi nombre o usan !bot.') +
+                    : 'Solo respondo cuando usan !bot (o !ia).') +
                 '\n\nCambiar: !libre on / !libre off'
             );
             return;
@@ -696,7 +696,7 @@ async function manejarComando(sock, msg) {
         await reaccionar('✅');
         await responder(nuevo
             ? 'listo, hablo libremente: sigo la conversación y respondo si dicen mi nombre'
-            : 'listo, modo callado: solo respondo si me mencionan, me responden un mensaje, escriben mi nombre o usan !bot');
+            : 'listo, modo callado: solo respondo cuando usan !bot');
         return;
     }
 

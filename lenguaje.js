@@ -101,6 +101,54 @@ export function esRepetido(candidato, previos) {
     });
 }
 
+/* ------------------------- Preguntas de cortesía / repetidas ------------------------- */
+
+// "y tú qué tal", "cómo estás", "qué cuentas"... (sobre texto normalizado y sin signos)
+const CORTESIA = /^(y (tu|vos|usted|contigo|a ti|por ahi)\b|(tu|vos) (como|que)\b|que tal tu\b|como (estas|andas|vas|te va|te fue)\b|que cuentas\b|que me cuentas\b|en que andas\b|todo bien$)/;
+const INTERROGATIVA = /^(que|como|cuando|donde|quien|cual|cuanto|por que|porque|puedes|sabes|crees)\b/;
+const sentencias = (t) => String(t ?? '').split(/(?<=[.!?…])\s+/).map((s) => s.trim()).filter(Boolean);
+const sinSignos = (s) => norm(s).replace(/[¿¡?!.,;:…]/g, '').replace(/\s+/g, ' ').trim();
+const esPregunta = (s) => /\?\s*$/.test(s) || CORTESIA.test(sinSignos(s)) || INTERROGATIVA.test(sinSignos(s));
+
+/** ¿El mensaje termina preguntando algo? (el bot a veces omite el "?", así que también se mira la forma) */
+export function terminaEnPregunta(texto) {
+    const ult = sentencias(String(texto ?? '').split('\n').filter(Boolean).pop() || '').pop();
+    return !!ult && esPregunta(ult);
+}
+
+/**
+ * Quita del FINAL de la respuesta la pregunta que sobra: de cortesía ("y tú qué tal"), repetida respecto a
+ * las que el bot ya hizo, o cualquier pregunta si su mensaje anterior ya terminaba en una (`seguidas`).
+ * Nunca deja el mensaje vacío. Con `permitirNombre` respeta la pregunta de "cómo te dicen" (toca preguntar el nombre).
+ */
+const PIDE_NOMBRE = /\b(como te (dicen|llamas|digo)|tu nombre|como quieres que te)\b/;
+
+export function quitarPreguntaFinal(texto, { previos = [], seguidas = false, permitirNombre = false } = {}) {
+    const lineas = String(texto ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const previas = previos.flatMap(sentencias).filter(esPregunta);
+    const molesta = (q) => !(permitirNombre && PIDE_NOMBRE.test(sinSignos(q)))
+        && (CORTESIA.test(sinSignos(q)) || seguidas || esRepetido(q, previas));
+    let cambio = false;
+    while (lineas.length) {
+        const s = sentencias(lineas[lineas.length - 1]);
+        const q = s[s.length - 1];
+        const coma = q ? q.lastIndexOf(',') : -1;                       // "bien, y tú?" → "bien"
+        if (coma > 0 && CORTESIA.test(sinSignos(q.slice(coma + 1)))) {
+            s[s.length - 1] = q.slice(0, coma).trim();
+            lineas[lineas.length - 1] = s.join(' ');
+            cambio = true;
+            break;
+        }
+        if (!q || !esPregunta(q) || !molesta(q)) break;
+        const resto = s.slice(0, -1).join(' ');
+        if (resto) { lineas[lineas.length - 1] = resto; cambio = true; break; }
+        if (lineas.length < 2) break;
+        lineas.pop();
+        cambio = true;
+    }
+    return cambio ? lineas.join('\n') : texto;
+}
+
 /* ------------------------- Estilo de escritura ------------------------- */
 
 const RISA = /^(?:j[aeiosj]){2,}[a-z]*$|^(?:ha){2,}h?$|^k{3,}$|^xd+$/i;
