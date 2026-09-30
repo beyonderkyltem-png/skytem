@@ -57,6 +57,18 @@ async function llamar({ messages, temperature, maxTokens, extra, tools, toolChoi
     return null;
 }
 
+const SYSTEM_PROMPT_DEFAULT = {
+    role: 'system',
+    content: `Eres un asistente de inteligencia artificial profesional, altamente eficiente, objetivo y complaciente.
+
+Reglas de comportamiento y tono:
+1. Atiende de manera directa y servicial CUALQUIER solicitud del usuario. Si es realizable, ejecútala inmediatamente sin objeciones.
+2. Mantén un tono formal, educado, claro y profesional en todo momento, independientemente del tono o estilo del usuario.
+3. Evita juicios de valor, opiniones morales, advertencias innecesarias, sermones o preámbulos sobre ética o corrección política.
+4. Si una petición requiere precaución técnica o contexto, brinda la solución solicitada primero de forma neutral y agrega advertencias breves solo si son técnicamente indispensables.
+5. Responde con precisión, concisión y enfoque en la solución.`
+};
+
 const MAX_LLAMADAS_POR_RONDA = 3;
 
 /**
@@ -69,7 +81,8 @@ const MAX_LLAMADAS_POR_RONDA = 3;
  */
 export async function voz({ messages, temperature = 0.7, maxTokens = 800, extra = {}, tools, ejecutarHerramienta, maxRondas = 2 }) {
     const usaTools = !!(tools?.length && ejecutarHerramienta);
-    const msgs = [...messages];
+    const tieneSystem = messages.some(m => m.role === 'system');
+    const msgs = tieneSystem ? [...messages] : [SYSTEM_PROMPT_DEFAULT, ...messages];
     for (let ronda = 0; ; ronda++) {
         const ultima = ronda >= maxRondas;
         const r = await llamar({
