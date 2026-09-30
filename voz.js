@@ -1,10 +1,10 @@
 /**
- * voz.js — el córtex motor / lenguaje. SOLO traduce a palabras lo que el cerebro ya decidió.
- * No guarda estado ni decide nada: recibe mensajes, devuelve texto.
- *
- * Usa el SDK oficial de OpenAI apuntando a Pollinations (API compatible con OpenAI).
+ * voz.js — conexión con Pollinations.
+ *  - voz():   texto con el SDK oficial de OpenAI apuntando a Pollinations (API compatible), con function calling opcional.
+ *  - imagen(): genera una imagen y devuelve un Buffer.
  */
 import OpenAI from 'openai';
+import axios from 'axios';
 
 // Acepta varios nombres de variable y limpia espacios, saltos de línea o comillas que se cuelan al pegar la key
 const KEY = (process.env.POLLINATIONS_API_KEY || process.env.POLLINATIONS_KEY || process.env.POLLINATIONS_TOKEN || '')
@@ -14,18 +14,26 @@ const KEY = (process.env.POLLINATIONS_API_KEY || process.env.POLLINATIONS_KEY ||
     .trim();
 
 const MODELO = process.env.POLLINATIONS_MODEL || 'openai';
+const IMG_BASE = (process.env.POLLINATIONS_IMAGE_URL || 'https://gen.pollinations.ai/image').replace(/\/+$/, '');
+const IMG_MODELO = process.env.POLLINATIONS_IMAGE_MODEL || 'flux';
 
 const cliente = new OpenAI({
     baseURL: process.env.POLLINATIONS_BASE_URL || 'https://gen.pollinations.ai/v1',
     apiKey: KEY || 'sin-key',                      // el SDK exige un valor; si no hay key se quita la cabecera:
     defaultHeaders: KEY ? undefined : { Authorization: null },
-    timeout: 30_000,
+    timeout: 60_000,
     maxRetries: 1
 });
 
 export const infoVoz = () => (KEY
-    ? `[VOZ] Pollinations key detectada (empieza por "${KEY.slice(0, 3)}", ${KEY.length} caracteres). Modelo: ${MODELO}.`
+    ? `[VOZ] Pollinations key detectada (empieza por "${KEY.slice(0, 3)}", ${KEY.length} caracteres). Texto: ${MODELO}. Imagen: ${IMG_MODELO}.`
     : '[VOZ] ATENCIÓN: no hay key de Pollinations (POLLINATIONS_API_KEY). Se intentará sin autenticación.');
+
+function avisar401() {
+    console.error(KEY
+        ? `[VOZ] 401: Pollinations rechazó la key (empieza por "${KEY.slice(0, 3)}", ${KEY.length} caracteres). Debe ser una key de https://enter.pollinations.ai/keys (sk_...).`
+        : '[VOZ] 401: no se envió ninguna key. Define POLLINATIONS_API_KEY en las variables de entorno y vuelve a desplegar.');
+}
 
 /** Una llamada al modelo con reintentos: algunos modelos rechazan ciertos parámetros (400), así que se va quitando lo opcional. */
 async function llamar({ messages, temperature, maxTokens, extra, tools, toolChoice }) {
@@ -42,11 +50,7 @@ async function llamar({ messages, temperature, maxTokens, extra, tools, toolChoi
             return await cliente.chat.completions.create({ model: MODELO, messages, ...intentos[i] });
         } catch (e) {
             if (e?.status === 400 && i < intentos.length - 1) continue;
-            if (e?.status === 401) {
-                console.error(KEY
-                    ? `[VOZ] 401: Pollinations rechazó la key (empieza por "${KEY.slice(0, 3)}", ${KEY.length} caracteres). Debe ser una key de https://enter.pollinations.ai/keys (sk_...).`
-                    : '[VOZ] 401: no se envió ninguna key. Define POLLINATIONS_API_KEY en las variables de entorno de Render y vuelve a desplegar.');
-            }
+            if (e?.status === 401) avisar401();
             throw e;
         }
     }
@@ -60,11 +64,10 @@ const MAX_LLAMADAS_POR_RONDA = 3;
  *          tools?: Array, ejecutarHerramienta?: (nombre: string, args: object) => Promise<string>, maxRondas?: number}} p
  * @returns {Promise<string>}
  *
- * Sin `tools` se comporta como antes (una llamada, devuelve texto). Con `tools`, si el modelo pide una herramienta,
- * se ejecuta con `ejecutarHerramienta` (que decide QUÉ se permite), se le devuelve el resultado y se vuelve a llamar,
- * hasta `maxRondas`. En la última ronda se le prohíbe pedir más herramientas para que cierre con texto.
+ * Sin `tools` hace una llamada y devuelve texto. Con `tools`, si el modelo pide una herramienta se ejecuta con
+ * `ejecutarHerramienta`, se le devuelve el resultado y se vuelve a llamar, hasta `maxRondas`.
  */
-export async function voz({ messages, temperature = 0.7, maxTokens = 160, extra = {}, tools, ejecutarHerramienta, maxRondas = 3 }) {
+export async function voz({ messages, temperature = 0.7, maxTokens = 800, extra = {}, tools, ejecutarHerramienta, maxRondas = 2 }) {
     const usaTools = !!(tools?.length && ejecutarHerramienta);
     const msgs = [...messages];
     for (let ronda = 0; ; ronda++) {
@@ -90,4 +93,25 @@ export async function voz({ messages, temperature = 0.7, maxTokens = 160, extra 
             msgs.push({ role: 'tool', tool_call_id: t.id, content: String(salida ?? '').slice(0, 1500) });
         }
     }
+}
+
+/**
+ * Genera una imagen con Pollinations. Devuelve un Buffer (jpeg/png).
+ * Si tu cuenta usa otra URL o modelo: POLLINATIONS_IMAGE_URL y POLLINATIONS_IMAGE_MODEL en el .env.
+ */
+export async function imagen(prompt, { ancho = 1024, alto = 1024 } = {}) {
+    const r = await axios.get(`${IMG_BASE}/${encodeURIComponent(prompt)}`, {
+        params: { model: IMG_MODELO, width: ancho, height: alto, nologo: true, seed: Math.floor(Math.random() * 1e9) },
+        headers: KEY ? { Authorization: `Bearer ${KEY}` } : {},
+        responseType: 'arraybuffer',
+        timeout: 90_000,
+        validateStatus: () => true
+    });
+    const tipo = String(r.headers['content-type'] || '');
+    if (r.status !== 200 || !tipo.startsWith('image/')) {
+        if (r.status === 401) avisar401();
+        const detalle = Buffer.from(r.data || '').toString('utf8').slice(0, 200).replace(/\s+/g, ' ');
+        throw new Error(`imagen Pollinations ${r.status}: ${detalle}`);
+    }
+    return Buffer.from(r.data);
 }
