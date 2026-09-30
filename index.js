@@ -643,8 +643,8 @@ const spams = new Map(); // chat -> { cancelado }
 // Ocultarlo del menú NO lo desactiva: sigue funcionando.
 const OCULTOS_DEL_MENU = new Set([]);
 const MENU = [
-    ['bot', '• !bot <mensaje> - Háblale al asistente (también responde si lo mencionas, le respondes o dices "skytem")'],
-    ['img', '• !img [vertical|horizontal] <descripción> - Genera una imagen con IA (también puedes pedírsela en la charla)'],
+    ['bot', '• !bot <mensaje> - Habla con el asistente'],
+    ['img', '• !img [vertical|horizontal] <descripción> - Genera una imagen con IA'],
     ['s', '• !s / !sticker - Convierte imagen/GIF/video a sticker'],
     ['spam', '• !spam <veces> <texto> - Repite un mensaje (admins; puedes etiquetar con @). Máx. ' + SPAM_MAX],
     ['spamstop', '• !spamstop - Detiene el spam en curso (admins)'],
@@ -841,7 +841,15 @@ async function manejarComando(sock, msg) {
     if (text === '!ayuda' || text === '!help') {
         await reaccionar('ℹ️');
         const acciones = Object.keys(ACCIONES).filter((c) => !OCULTOS_DEL_MENU.has('/' + c)).map((c) => '/' + c);
-        const menu = `*Comandos disponibles:*\n` +
+        const intro = '*SKYTEM - asistente de IA*\n' +
+            'Para hablarle escribe "skytem ..." en cualquier parte del mensaje, arróbalo, responde a un mensaje suyo o usa !bot <mensaje>. En privado responde siempre.\n\n' +
+            'No necesitas escribir los comandos: también puedes pedírselos hablando. Ejemplos:\n' +
+            '• skytem hazme una imagen de un gato astronauta\n' +
+            '• skytem haz spam de 5 mensajes que digan hola\n' +
+            '• skytem etiqueta a todos, hay reunión\n' +
+            '• skytem lanza una moneda / abraza a @persona\n' +
+            'Los comandos de admin (spam, todos) solo funcionan si eres admin del grupo.\n\n';
+        const menu = intro + `*Comandos:*\n` +
             MENU.filter(([id]) => !OCULTOS_DEL_MENU.has(id)).map(([, t]) => t).join('\n') +
             (acciones.length ? `\n\n*Acciones (usar con /):*\n• ${acciones.join(', ')}` : '');
         await responder(menu);
