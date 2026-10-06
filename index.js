@@ -743,7 +743,7 @@ async function iniciarSocket() {
 /* ------------------------------ Comandos ------------------------------ */
 
 const SPAM_MAX = Math.max(1, Number(process.env.SPAM_MAX ?? 100));
-const SPAM_DELAY_MS = Math.max(100, Number(process.env.SPAM_DELAY_MS ?? 100));
+const SPAM_DELAY_MS = Math.max(10, Number(process.env.SPAM_DELAY_MS ?? 20));
 const spams = new Map(); // chat -> { cancelado }
 
 // Menú: para quitar un comando del menú, añade su nombre a OCULTOS_DEL_MENU (las acciones con "/", ej. '/golpear').
