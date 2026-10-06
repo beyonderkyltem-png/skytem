@@ -1,6 +1,6 @@
 /**
  * voz.js — conexión con las IAs.
- *  - voz():    texto con el SDK oficial de OpenAI contra varios proveedores compatibles
+ *  - voz():    texto (y lectura de imágenes) con el SDK oficial de OpenAI contra varios proveedores compatibles
  *              (Gemini, Groq, OpenRouter, Pollinations). Si uno falla o se queda sin cuota,
  *              pasa solo al siguiente. Soporta function calling.
  *  - imagen(): genera una imagen con Pollinations y devuelve un Buffer.
@@ -11,6 +11,7 @@
  *   OPENROUTER_API_KEY  + OPENROUTER_MODEL  (https://openrouter.ai/keys)
  *   POLLINATIONS_API_KEY + POLLINATIONS_MODEL (respaldo final y generación de imágenes)
  *   IA_ORDEN=gemini,groq,openrouter,pollinations   (orden de prioridad)
+ *   IA_VISION=gemini,pollinations                  (proveedores que pueden leer imágenes)
  */
 import OpenAI from 'openai';
 import axios from 'axios';
@@ -95,10 +96,33 @@ function pausar(p, e) {
     if (ms) p.pausa = Date.now() + ms;
 }
 
-function candidatos(preferido) {
-    const base = preferido ? [preferido, ...PROVEEDORES.filter((p) => p !== preferido)] : PROVEEDORES;
+// Proveedores que aceptan imágenes. Gemini sí; los demás dependen del modelo: añádelos con IA_VISION=gemini,groq,...
+const VISION = new Set((process.env.IA_VISION || 'gemini,pollinations')
+    .split(/[,\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean));
+
+const traeImagen = (msgs) => msgs.some((m) => Array.isArray(m.content) && m.content.some((c) => c.type === 'image_url'));
+
+// Si ningún proveedor ve imágenes, se manda solo el texto (con un aviso) en vez de fallar
+const sinImagenes = (msgs) => msgs.map((m) => (Array.isArray(m.content)
+    ? { ...m, content: m.content.map((c) => (c.type === 'text' ? c.text : '[imagen no disponible]')).join('\n') }
+    : m));
+
+function candidatos(preferido, soloVision = false) {
+    const lista = soloVision ? PROVEEDORES.filter((p) => VISION.has(p.id)) : PROVEEDORES;
+    const base = preferido && lista.includes(preferido) ? [preferido, ...lista.filter((p) => p !== preferido)] : lista;
     const libres = base.filter((p) => p.pausa <= Date.now());
     return libres.length ? libres : base; // si todos descansan, se prueban igual
+}
+
+/** Mensaje de usuario con texto + imágenes ({ buf, mime }) para que la IA las "vea". */
+export function mensajeConImagenes(texto, fotos, role = 'user') {
+    return {
+        role,
+        content: [
+            { type: 'text', text: texto || 'Describe esta imagen.' },
+            ...fotos.map((f) => ({ type: 'image_url', image_url: { url: `data:${f.mime || 'image/jpeg'};base64,${f.buf.toString('base64')}` } }))
+        ]
+    };
 }
 
 // Gemini añade datos propios a las llamadas a herramientas; los demás proveedores no los aceptan
@@ -133,9 +157,16 @@ async function llamarProveedor(p, messages, { temperature, maxTokens, extra, too
 /** Prueba los proveedores en orden hasta que uno responda. Devuelve la respuesta y quién la dio. */
 async function llamar({ messages, ...resto }, preferido) {
     let ultimo;
-    for (const p of candidatos(preferido)) {
+    let msgs = messages;
+    let lista = [];
+    if (traeImagen(msgs)) {
+        lista = candidatos(preferido, true);
+        if (!lista.length) { console.error('[VOZ] ningún proveedor con visión configurado: se responde sin la imagen'); msgs = sinImagenes(msgs); }
+    }
+    if (!lista.length) lista = candidatos(preferido);
+    for (const p of lista) {
         try {
-            const r = await llamarProveedor(p, p.id === 'gemini' ? messages : sinExtras(messages), resto);
+            const r = await llamarProveedor(p, p.id === 'gemini' ? msgs : sinExtras(msgs), resto);
             return { r, p };
         } catch (e) {
             ultimo = e;

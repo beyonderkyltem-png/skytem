@@ -9,7 +9,7 @@ import pino from 'pino';
 import ffmpegPath from 'ffmpeg-static';
 import fluentFfmpeg from 'fluent-ffmpeg';
 import stickerPkg from 'wa-sticker-formatter';
-import { voz, infoVoz, imagen } from './voz.js';
+import { voz, infoVoz, imagen, mensajeConImagenes } from './voz.js';
 import makeWASocket, {
     Browsers,
     BufferJSON,
@@ -228,7 +228,7 @@ function tipoMedia(m) {
     return '';
 }
 
-// Texto + marca de multimedia (el bot no ve fotos, audios ni videos: solo sabe que existen)
+// Texto + marca de multimedia (las fotos del mensaje actual se le pasan a la IA aparte; audios y videos solo se anotan)
 function descripcionMensaje(m) {
     const t = obtenerTexto(m).trim();
     const media = tipoMedia(m);
@@ -281,6 +281,52 @@ function extraerMenciones(chat, texto) {
         if (p && !jids.includes(p.jid)) jids.push(p.jid);
     }
     return jids;
+}
+
+/* ------------------------------ Fotos que el bot puede leer ------------------------------ */
+
+const MAX_FOTOS = 2;                 // la del mensaje + la del mensaje citado
+const MAX_FOTO_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Descarga la foto del mensaje (y la del mensaje al que responde, si la hay) para que la IA las vea.
+ * Los stickers, videos y GIF no cuentan. Si una descarga falla, simplemente se ignora esa foto.
+ */
+async function obtenerFotos(sock, msg, contenido, ctx, chat) {
+    const candidatas = [];
+    if (contenido.imageMessage) candidatas.push({ objeto: msg, mime: contenido.imageMessage.mimetype });
+    if (ctx?.quotedMessage) {
+        const q = desenvolver(ctx.quotedMessage);
+        if (q.imageMessage) {
+            candidatas.push({
+                objeto: { key: { remoteJid: chat, id: ctx.stanzaId, participant: ctx.participant }, message: ctx.quotedMessage },
+                mime: q.imageMessage.mimetype
+            });
+        }
+    }
+    const fotos = [];
+    for (const c of candidatas.slice(0, MAX_FOTOS)) {
+        try {
+            const buf = await downloadMediaMessage(c.objeto, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+            if (buf?.length && buf.length <= MAX_FOTO_BYTES) fotos.push({ buf, mime: c.mime || 'image/jpeg' });
+        } catch (e) {
+            console.error('No pude descargar la foto:', e.message);
+        }
+    }
+    return fotos;
+}
+
+// Pega las fotos al último mensaje del usuario (el que se está respondiendo)
+function adjuntarFotos(mensajes, fotos) {
+    if (!fotos.length) return mensajes;
+    for (let i = mensajes.length - 1; i >= 0; i--) {
+        if (mensajes[i].role === 'user') {
+            mensajes[i] = mensajeConImagenes(String(mensajes[i].content), fotos);
+            return mensajes;
+        }
+    }
+    mensajes.push(mensajeConImagenes('', fotos));
+    return mensajes;
 }
 
 /* ------------------------------ Asistente ------------------------------ */
@@ -422,7 +468,7 @@ function promptSistema(chat, esGrupo, etiqueta, nombre) {
         '- No repitas siempre las mismas frases ni cierres cada respuesta con una pregunta. Pregunta solo cuando de verdad te falte un dato.',
         '',
         'Formato WhatsApp: *negrita* con un solo asterisco, _cursiva_ con guion bajo, ``` para código. No uses encabezados con # ni tablas.',
-        'Si piden una imagen, foto, dibujo, ilustración, logo o arte, usa la herramienta generar_imagen (no digas que no puedes). No puedes ver fotos, videos ni audios que te envíen: solo sabes que existen.',
+        'Si piden una imagen, foto, dibujo, ilustración, logo o arte, usa la herramienta generar_imagen (no digas que no puedes). Puedes ver las fotos que te llegan en el mensaje actual (o la foto del mensaje al que responden): descríbelas, léelas, respóndeles sobre ellas. De fotos anteriores del historial solo sabes que existieron; si te piden mirar una vieja, que la reenvíen. No puedes ver videos, GIF ni audios: solo sabes que existen.',
         `Fecha y hora actuales: ${new Date().toLocaleString('es-ES', { timeZone: ZONA })} (${ZONA}).`
     ];
     if (esGrupo) {
@@ -469,7 +515,7 @@ async function enviarTexto(sock, chat, texto, opciones) {
     }
 }
 
-async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre }) {
+async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre, fotos = [] }) {
     const imagenes = [];
     const ejecutarHerramienta = async (nombre, args) => {
         if (nombre !== 'generar_imagen') return 'Esa herramienta no existe.';
@@ -492,7 +538,7 @@ async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre }
     const bruto = await voz({
         messages: [
             { role: 'system', content: promptSistema(chat, esGrupo, etiqueta, nombre) },
-            ...armarMensajes(esGrupo, ventana, etiqueta)
+            ...adjuntarFotos(armarMensajes(esGrupo, ventana, etiqueta), fotos)
         ],
         temperature: 0.7,
         maxTokens: 2000,
@@ -534,9 +580,10 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
     let texto = (textoForzado ?? descripcionMensaje(contenido)).trim();
     if (!texto) return;
     // Foto, sticker, audio... sin texto: se anota en la charla pero no dispara respuesta
-    const soloMedia = !forzar && /^\[[^\]]+\]$/.test(texto);
-
+    // (en privado, una foto sin texto sí se responde: se supone que quieres que la mire)
     const esGrupo = chat.endsWith('@g.us');
+    const soloMedia = !forzar && /^\[[^\]]+\]$/.test(texto) && !(contenido.imageMessage && !esGrupo);
+
     const jid = msg.key.participant || chat;
     const nombre = msg.pushName || soloNumero(jid);
     const ctx = obtenerContexto(contenido);
@@ -579,7 +626,8 @@ async function conversar(sock, msg, { forzar = false, texto: textoForzado } = {}
     await enCola(chat, async () => {
         sock.sendPresenceUpdate('composing', chat).catch(() => {});
         try {
-            await responderAsistente(sock, msg, { chat, esGrupo, registro, nombre });
+            const fotos = await obtenerFotos(sock, msg, contenido, ctx, chat);
+            await responderAsistente(sock, msg, { chat, esGrupo, registro, nombre, fotos });
         } catch (e) {
             console.error('Error generando respuesta:', e.message);
             await sock.sendMessage(chat, { text: 'No pude generar la respuesta ahora mismo. Intenta de nuevo en un momento.' }, { quoted: msg }).catch(() => {});
@@ -902,7 +950,8 @@ async function manejarComando(sock, msg) {
         const acciones = Object.keys(ACCIONES).filter((c) => !OCULTOS_DEL_MENU.has('/' + c)).map((c) => '/' + c);
         const intro = '*SKYTEM - asistente de IA*\n' +
             'Para hablarle escribe "skytem ..." en cualquier parte del mensaje, arróbalo, responde a un mensaje suyo o usa !bot <mensaje>. En privado responde siempre.\n' +
-            'También puedes pedirle imágenes hablando, ej: "skytem hazme una imagen de un gato astronauta".\n\n' +
+            'También puedes pedirle imágenes hablando, ej: "skytem hazme una imagen de un gato astronauta".\n' +
+            'Y puede ver fotos: mándale una con "skytem ..." de texto, o responde a una foto diciéndole "skytem qué es esto".\n\n' +
             'Los comandos hay que escribirlos con ! (las acciones con /). Hablándole no los ejecuta. Los de admin (spam, todos) solo funcionan si eres admin del grupo.\n\n';
         const menu = intro + `*Comandos:*\n` +
             MENU.filter(([id]) => !OCULTOS_DEL_MENU.has(id)).map(([, t]) => t).join('\n') +
