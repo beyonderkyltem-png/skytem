@@ -42,7 +42,7 @@ if (!MONGO_URI) {
     process.exit(1);
 }
 
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: process.env.LOG_LEVEL || 'warn' }); // 'warn' deja ver errores de descifrado; LOG_LEVEL=silent para callarlo
 
 /* ------------------------------ MongoDB (sesión de WhatsApp, lista de juegos y memoria de las charlas) ------------------------------ */
 
@@ -934,9 +934,17 @@ async function iniciarSocket() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify' && type !== 'append') return;
+        if (type !== 'notify' && type !== 'append') { console.log(`[UPSERT] ignorado, type=${type}`); return; }
         for (const msg of messages) {
             try {
+                // Diagnóstico de chats privados (DEBUG_PRIVADOS=0 lo apaga)
+                const rj = msg.key?.remoteJid || '';
+                if (rj && !/@(g\.us|broadcast|newsletter)$/.test(rj) && process.env.DEBUG_PRIVADOS !== '0') {
+                    const cont = msg.message
+                        ? Object.keys(msg.message).join(',')
+                        : `SIN CONTENIDO (stub=${msg.messageStubType ?? '-'} ${(msg.messageStubParameters || []).join(' ').slice(0, 80)})`;
+                    console.log(`[PRIVADO] type=${type} fromMe=${!!msg.key.fromMe} de=${rj} contenido=${cont}`);
+                }
                 if (!msg.message || !msg.key?.id) continue;
                 if (procesados.has(msg.key.id)) continue;
                 procesados.add(msg.key.id);
