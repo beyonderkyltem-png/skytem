@@ -38,9 +38,14 @@ const IMG_MODELO = process.env.POLLINATIONS_IMAGE_MODEL || 'flux';
 /* ------------------------------ Proveedores de texto ------------------------------ */
 
 // Los límites gratuitos y los nombres de modelo cambian seguido: si alguno da 404, ajusta su *_MODEL en el .env.
+// Varias keys de Gemini separadas por coma: GEMINI_API_KEYS=key1,key2,key3 (también vale GEMINI_API_KEY con una sola o con varias)
+const GEMINI_KEYS = [process.env.GEMINI_API_KEYS, process.env.GEMINI_API_KEY, process.env.GOOGLE_API_KEY]
+    .filter(Boolean).join(',')
+    .split(/[,\s;]+/).map(limpiarKey).filter((k, i, a) => k && a.indexOf(k) === i);
+
 const CATALOGO = {
     gemini: {
-        key: limpiarKey(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY),
+        key: GEMINI_KEYS[0] || '',
         baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
         modelo: process.env.GEMINI_MODEL || 'gemini-3.6-flash'
     },
@@ -67,7 +72,9 @@ const ORDEN = (process.env.IA_ORDEN || 'gemini,groq,openrouter,pollinations')
 
 const PROVEEDORES = ORDEN
     .filter((id) => CATALOGO[id] && (CATALOGO[id].key || CATALOGO[id].sinKey))
-    .map((id) => ({ id, ...CATALOGO[id], cliente: null, pausa: 0 }));
+    .flatMap((id) => (id === 'gemini'
+        ? GEMINI_KEYS.map((key, n) => ({ id, ...CATALOGO[id], key, nombre: GEMINI_KEYS.length > 1 ? `gemini#${n + 1}` : 'gemini', cliente: null, pausa: 0 }))
+        : [{ id, ...CATALOGO[id], nombre: id, cliente: null, pausa: 0 }]));
 
 function clienteDe(p) {
     if (!p.cliente) {
@@ -83,11 +90,11 @@ function clienteDe(p) {
 }
 
 const infoTexto = () => (PROVEEDORES.length
-    ? `[VOZ] IAs de texto (en orden): ${PROVEEDORES.map((p) => `${p.id}:${p.modelo}`).join(' -> ')}. Imagen: Pollinations ${IMG_MODELO}${KEY ? '' : ' (sin key)'}.`
+    ? `[VOZ] IAs de texto (en orden): ${PROVEEDORES.map((p) => `${p.nombre}:${p.modelo}`).join(' -> ')}. Imagen: Pollinations ${IMG_MODELO}${KEY ? '' : ' (sin key)'}.`
     : '[VOZ] ATENCIÓN: no hay ninguna IA configurada. Define GEMINI_API_KEY, GROQ_API_KEY u OPENROUTER_API_KEY.');
 
 export const infoVoz = () => {
-    const audio = [CATALOGO.groq.key && `groq:${WHISPER_MODELO}`, CATALOGO.gemini.key && `gemini:${CATALOGO.gemini.modelo}`].filter(Boolean);
+    const audio = [CATALOGO.groq.key && `groq:${WHISPER_MODELO}`, GEMINI_KEYS.length && `gemini x${GEMINI_KEYS.length}:${CATALOGO.gemini.modelo}`].filter(Boolean);
     return `${infoTexto()}\n[VOZ] Transcripción de audios: ${audio.length ? audio.join(' -> ') : 'NO disponible (define GROQ_API_KEY o GEMINI_API_KEY)'}. `
         + `Búsqueda web: ${TAVILY_KEY ? 'Tavily' : 'DuckDuckGo (sin TAVILY_API_KEY puede fallar)'}.`;
 };
@@ -188,7 +195,7 @@ async function llamar({ messages, ...resto }, preferido, limite) {
             ultimo = e;
             pausar(p, e);
             if (e?.status === 401 && p.id === 'pollinations') avisar401();
-            console.error(`[VOZ] ${p.id} (${p.modelo}) falló: ${e?.status ?? e?.code ?? ''} ${String(e?.message || '').slice(0, 160)}`);
+            console.error(`[VOZ] ${p.nombre} (${p.modelo}) falló: ${e?.status ?? e?.code ?? ''} ${String(e?.message || '').slice(0, 160)}`);
         }
     }
     throw ultimo ?? new Error('No hay ninguna IA configurada');
@@ -380,11 +387,12 @@ export async function buscar(consulta, max = 4) {
 
 const WHISPER_MODELO = process.env.GROQ_WHISPER_MODEL || 'whisper-large-v3-turbo';
 const clientesApi = new Map();
-function clienteApi(id) {
-    if (!clientesApi.has(id)) {
-        clientesApi.set(id, new OpenAI({ baseURL: CATALOGO[id].baseURL, apiKey: CATALOGO[id].key, timeout: 60_000, maxRetries: 0 }));
+function clienteApi(id, key = CATALOGO[id].key) {
+    const clave = `${id}:${key}`;
+    if (!clientesApi.has(clave)) {
+        clientesApi.set(clave, new OpenAI({ baseURL: CATALOGO[id].baseURL, apiKey: key, timeout: 60_000, maxRetries: 0 }));
     }
-    return clientesApi.get(id);
+    return clientesApi.get(clave);
 }
 
 /** Convierte cualquier audio (ogg/opus de WhatsApp, m4a...) a mp3 mono con el ffmpeg incluido, sin archivos temporales. */
@@ -429,25 +437,29 @@ export async function transcribir(buf, mime = 'audio/ogg') {
         }
     }
 
-    if (CATALOGO.gemini.key) {
-        try {
-            const mp3 = await aMp3(buf);
-            const r = await clienteApi('gemini').chat.completions.create({
-                model: CATALOGO.gemini.modelo,
-                temperature: 0,
-                messages: [{
-                    role: 'user',
-                    content: [
-                        { type: 'text', text: 'Transcribe literalmente este audio en el idioma en que se habla. Responde solo con la transcripción, sin comentarios. Si no hay voz, responde exactamente: [sin voz]' },
-                        { type: 'input_audio', input_audio: { data: mp3.toString('base64'), format: 'mp3' } }
-                    ]
-                }]
-            });
-            const t = quitarPensamiento(r?.choices?.[0]?.message?.content);
-            if (!t) throw new Error('respuesta vacía');
-            return /^\[sin voz\]$/i.test(t) ? '' : t;
-        } catch (e) {
-            errores.push(`gemini: ${e?.status ?? ''} ${String(e?.message || '').slice(0, 120)}`);
+    if (GEMINI_KEYS.length) {
+        let mp3;
+        try { mp3 = await aMp3(buf); } catch (e) { errores.push(`ffmpeg: ${String(e?.message || '').slice(0, 120)}`); }
+        for (const [n, key] of GEMINI_KEYS.entries()) {
+            if (!mp3) break;
+            try {
+                const r = await clienteApi('gemini', key).chat.completions.create({
+                    model: CATALOGO.gemini.modelo,
+                    temperature: 0,
+                    messages: [{
+                        role: 'user',
+                        content: [
+                            { type: 'text', text: 'Transcribe literalmente este audio en el idioma en que se habla. Responde solo con la transcripción, sin comentarios. Si no hay voz, responde exactamente: [sin voz]' },
+                            { type: 'input_audio', input_audio: { data: mp3.toString('base64'), format: 'mp3' } }
+                        ]
+                    }]
+                });
+                const t = quitarPensamiento(r?.choices?.[0]?.message?.content);
+                if (!t) throw new Error('respuesta vacía');
+                return /^\[sin voz\]$/i.test(t) ? '' : t;
+            } catch (e) {
+                errores.push(`gemini#${n + 1}: ${e?.status ?? ''} ${String(e?.message || '').slice(0, 120)}`);
+            }
         }
     }
 
