@@ -9,7 +9,7 @@ import pino from 'pino';
 import ffmpegPath from 'ffmpeg-static';
 import fluentFfmpeg from 'fluent-ffmpeg';
 import stickerPkg from 'wa-sticker-formatter';
-import { voz, infoVoz, imagen, mensajeConImagenes, buscar, transcribir } from './voz.js';
+import { voz, infoVoz, imagen, mensajeConImagenes, buscar, transcribir, hablar, aNotaDeVoz } from './voz.js';
 import makeWASocket, {
     Browsers,
     BufferJSON,
@@ -522,6 +522,33 @@ const HERRAMIENTAS_IA = [{
             required: ['consulta']
         }
     }
+}, {
+    type: 'function',
+    function: {
+        name: 'enviar_audio',
+        description: 'Envía una nota de voz (audio hablado) al chat. Úsala cuando pidan que les hables, les mandes un audio, una nota de voz, que digas algo en voz alta o que lo leas en voz alta.',
+        parameters: {
+            type: 'object',
+            properties: {
+                texto: { type: 'string', description: 'Lo que se dirá en el audio, tal cual se debe pronunciar (sin asteriscos ni formato). Máximo unas 150 palabras.' },
+                voz: { type: 'string', enum: ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'], description: 'Voz opcional. nova y shimmer suenan femeninas; onyx y echo, masculinas.' }
+            },
+            required: ['texto']
+        }
+    }
+}, {
+    type: 'function',
+    function: {
+        name: 'crear_sticker',
+        description: 'Crea un sticker de WhatsApp con IA a partir de una descripción y lo envía. Úsala cuando pidan un sticker, una pegatina o un meme en sticker.',
+        parameters: {
+            type: 'object',
+            properties: {
+                prompt: { type: 'string', description: 'Descripción del sticker (personaje, expresión, estilo). Preferiblemente en inglés, estilo sticker con fondo simple.' }
+            },
+            required: ['prompt']
+        }
+    }
 }];
 
 function promptSistema(chat, esGrupo, etiqueta, nombre) {
@@ -538,6 +565,7 @@ function promptSistema(chat, esGrupo, etiqueta, nombre) {
         '',
         'Formato WhatsApp: *negrita* con un solo asterisco, _cursiva_ con guion bajo, ``` para código. No uses encabezados con # ni tablas.',
         'Si piden una imagen, foto, dibujo, ilustración, logo o arte, usa la herramienta generar_imagen (no digas que no puedes). Puedes ver las fotos que te llegan en el mensaje actual (o la foto del mensaje al que responden): descríbelas, léelas, respóndeles sobre ellas. De fotos anteriores del historial solo sabes que existieron; si te piden mirar una vieja, que la reenvíen. No puedes ver videos ni GIF: solo sabes que existen. Los audios solo los conoces si llegan transcritos: el mensaje empieza con [nota de voz] y sigue el texto (es una transcripción automática y puede tener errores de palabras; interprétala con sentido común).',
+        'Lo que SÍ puedes enviar: imágenes (generar_imagen), notas de voz (enviar_audio, con voz sintetizada) y stickers (crear_sticker). Nunca digas que no puedes mandar imágenes, audios o stickers: usa la herramienta correspondiente y listo. Si piden un audio, llama a enviar_audio con el texto que dirías (y añade como mucho una frase corta en texto). Lo que NO puedes: enviar videos ni GIF, hacer llamadas, ni mandar archivos como PDF o documentos; si piden eso, dilo con claridad y ofrece una alternativa. Los comandos del bot (!img, !s, /abrazar...) los ejecuta el usuario, no tú.',
         'Tienes la herramienta buscar_web: úsala cuando la respuesta dependa de información actual o que no sabes con certeza (noticias, resultados, precios, clima, versiones, cargos, hechos recientes). Basa la respuesta en lo que devuelva y menciona la fuente de forma breve; si no devuelve nada fiable, dilo. No la uses para charla ni para lo que ya sabes bien.',
         `Fecha y hora actuales: ${new Date().toLocaleString('es-ES', { timeZone: ZONA })} (${ZONA}).`
     ];
@@ -587,6 +615,8 @@ async function enviarTexto(sock, chat, texto, opciones) {
 
 async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre, fotos = [] }) {
     const imagenes = [];
+    const audios = [];
+    const stickers = [];
     let busquedas = 0;
     const ejecutarHerramienta = async (nombre, args) => {
         if (nombre === 'buscar_web') {
@@ -595,6 +625,25 @@ async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre, 
             if (!consulta) return 'error: falta la consulta';
             busquedas++;
             return await buscar(consulta);
+        }
+        if (nombre === 'enviar_audio') {
+            if (audios.length >= 1) return 'Límite de audios por mensaje alcanzado.';
+            const textoAudio = limpiar(args?.texto, 900);
+            if (!textoAudio) return 'error: falta el texto del audio';
+            const mp3 = await hablar(textoAudio, args?.voz);
+            let ogg = null;
+            try { ogg = await aNotaDeVoz(mp3); } catch (e) { console.error('No pude convertir a nota de voz:', e.message); }
+            audios.push({ buf: ogg || mp3, ptt: !!ogg, texto: textoAudio });
+            return 'Audio generado; se enviará solo. Responde sin repetir lo que dice el audio.';
+        }
+        if (nombre === 'crear_sticker') {
+            if (stickers.length >= 2) return 'Límite de stickers por mensaje alcanzado.';
+            const p = limpiar(args?.prompt, 600);
+            if (!p) return 'error: falta la descripción del sticker';
+            const img = await imagen(`sticker, ${p}, simple plain background, bold outline`, FORMATOS.cuadrada);
+            const st = new Sticker(img, { pack: 'SKYTEM', author: 'Les Exitoses', type: 'full', quality: 50 });
+            stickers.push({ buf: await st.toBuffer(), prompt: p });
+            return 'Sticker creado; se enviará solo. Responde breve o no digas nada más.';
         }
         if (nombre !== 'generar_imagen') return 'Esa herramienta no existe.';
         if (imagenes.length >= 2) return 'Límite de imágenes por mensaje alcanzado.';
@@ -622,7 +671,7 @@ async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre, 
     });
 
     const texto = aFormatoWhatsApp(String(bruto ?? '').trim());
-    if (!texto && !imagenes.length) throw new Error('respuesta vacía');
+    if (!texto && !imagenes.length && !audios.length && !stickers.length) throw new Error('respuesta vacía');
 
     const opciones = esGrupo ? { quoted: msg } : undefined;
     if (imagenes.length === 1 && texto && texto.length <= 900) {
@@ -638,8 +687,19 @@ async function responderAsistente(sock, msg, { chat, esGrupo, registro, nombre, 
         if (texto) await enviarTexto(sock, chat, texto, imagenes.length ? undefined : opciones);
     }
 
+    for (const a of audios) {
+        await sock.sendMessage(chat, a.ptt
+            ? { audio: a.buf, mimetype: 'audio/ogg; codecs=opus', ptt: true }
+            : { audio: a.buf, mimetype: 'audio/mpeg' }, opciones);
+    }
+    for (const s of stickers) {
+        await sock.sendMessage(chat, { sticker: s.buf }, opciones);
+    }
+
+    const notaAudio = audios.length ? ` (nota de voz enviada: "${audios.map((a) => a.texto).join(' | ').slice(0, 300)}")` : '';
+    const notaSticker = stickers.length ? ` (sticker enviado: ${stickers.map((s) => s.prompt).join(' | ').slice(0, 200)})` : '';
     const notaImg = imagenes.length ? ` (imagen enviada: ${imagenes.map((i) => i.prompt).join(' | ').slice(0, 300)})` : '';
-    await anotar(chat, { bot: true, texto: `${texto}${notaImg}`.trim() });
+    await anotar(chat, { bot: true, texto: `${texto}${notaImg}${notaAudio}${notaSticker}`.trim() });
 }
 
 // Deja en la consola por qué NO se respondió un mensaje en un chat privado (en grupos callar es lo normal)
@@ -1115,7 +1175,7 @@ async function manejarComando(sock, msg, apagado = false) {
         const acciones = Object.keys(ACCIONES).filter((c) => !OCULTOS_DEL_MENU.has('/' + c)).map((c) => '/' + c);
         const intro = '*SKYTEM - asistente de IA*\n' +
             'Para hablarle escribe "skytem ..." en cualquier parte del mensaje, arróbalo, responde a un mensaje suyo o usa !bot <mensaje>. En privado responde siempre.\n' +
-            'También puedes pedirle imágenes hablando, ej: "skytem hazme una imagen de un gato astronauta".\n' +
+            'También puedes pedirle imágenes, stickers o notas de voz hablando, ej: "skytem hazme una imagen de un gato astronauta", "skytem hazme un sticker de un perro feliz" o "skytem mándame un audio diciendo buenos días".\n' +
             'Y puede ver fotos: mándale una con "skytem ..." de texto, o responde a una foto diciéndole "skytem qué es esto".\n' +
             'Si hace falta, busca en internet. También entiende notas de voz: en privado las transcribe y responde; en un grupo, responde a un audio diciéndole "skytem ...".\n\n' +
             'Los comandos hay que escribirlos con ! (las acciones con /). Hablándole no los ejecuta. Los de admin (spam, todos) solo funcionan si eres admin del grupo.\n\n';

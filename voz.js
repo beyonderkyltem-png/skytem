@@ -263,6 +263,51 @@ export async function imagen(prompt, { ancho = 1024, alto = 1024 } = {}) {
     return Buffer.from(r.data);
 }
 
+/* ------------------------------ Texto a voz (notas de voz) ------------------------------ */
+
+const AUDIO_BASE = (process.env.POLLINATIONS_AUDIO_URL || 'https://gen.pollinations.ai/audio').replace(/\/+$/, '');
+const VOCES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'];
+const VOZ_TTS = process.env.TTS_VOZ || 'nova';
+
+/** Convierte texto en un audio mp3 (Buffer) con Pollinations. */
+export async function hablar(texto, vozElegida) {
+    const t = String(texto ?? '').trim().slice(0, 900);
+    if (!t) throw new Error('texto vacío');
+    const v = VOCES.includes(String(vozElegida).toLowerCase()) ? String(vozElegida).toLowerCase() : VOZ_TTS;
+    const r = await axios.get(`${AUDIO_BASE}/${encodeURIComponent(t)}`, {
+        params: { voice: v },
+        headers: KEY ? { Authorization: `Bearer ${KEY}` } : {},
+        responseType: 'arraybuffer',
+        timeout: 60_000,
+        validateStatus: () => true
+    });
+    const tipo = String(r.headers['content-type'] || '');
+    if (r.status !== 200 || !tipo.startsWith('audio/')) {
+        if (r.status === 401) avisar401();
+        const detalle = Buffer.from(r.data || '').toString('utf8').slice(0, 200).replace(/\s+/g, ' ');
+        throw new Error(`audio Pollinations ${r.status}: ${detalle}`);
+    }
+    return Buffer.from(r.data);
+}
+
+/** mp3 -> ogg/opus: el formato de las notas de voz de WhatsApp. */
+export function aNotaDeVoz(buf) {
+    return new Promise((resolve, reject) => {
+        const ff = spawn(process.env.FFMPEG_PATH || 'ffmpeg',
+            ['-v', 'error', '-i', 'pipe:0', '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', '-f', 'ogg', 'pipe:1']);
+        const salida = [];
+        let err = '';
+        ff.stdout.on('data', (d) => salida.push(d));
+        ff.stderr.on('data', (d) => { err += d; });
+        ff.stdin.on('error', () => {});
+        ff.on('error', reject);
+        ff.on('close', (code) => (code === 0 && salida.length
+            ? resolve(Buffer.concat(salida))
+            : reject(new Error(`ffmpeg ${code}: ${err.slice(0, 120)}`))));
+        ff.stdin.end(buf);
+    });
+}
+
 /* ------------------------------ Búsqueda web ------------------------------ */
 
 const TAVILY_KEY = limpiarKey(process.env.TAVILY_API_KEY);
