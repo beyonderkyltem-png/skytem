@@ -27,7 +27,35 @@ process.on('unhandledRejection', (r) => console.error('Promesa rechazada sin man
 process.on('uncaughtException', (e) => console.error('Excepción sin capturar:', e));
 
 // Servidor mínimo por si el hosting exige abrir un puerto
-http.createServer((req, res) => res.end('SKYTEM activo')).listen(process.env.PORT || 3000);
+let sockActual = null; // se rellena en iniciarSocket()
+
+http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/aternos') {
+        let body = '';
+        req.on('data', (c) => { body += c; if (body.length > 10_000) req.destroy(); });
+        req.on('end', async () => {
+            try {
+                const esperado = `Bearer ${process.env.ATERNOS_TOKEN || ''}`;
+                if (!process.env.ATERNOS_TOKEN || req.headers.authorization !== esperado) {
+                    res.statusCode = 401;
+                    return res.end('no');
+                }
+                const { chat, texto } = JSON.parse(body);
+                if (!sockActual || !/@(g\.us|s\.whatsapp\.net|lid)$/.test(String(chat))) {
+                    res.statusCode = 400;
+                    return res.end('chat invalido');
+                }
+                await sockActual.sendMessage(chat, { text: proteger(String(texto).slice(0, 1000)) });
+                res.end('ok');
+            } catch (e) {
+                res.statusCode = 400;
+                res.end('error');
+            }
+        });
+        return;
+    }
+    res.end('SKYTEM activo');
+}).listen(process.env.PORT || 3000);
 
 // FFmpeg (binario incluido en npm, no requiere instalar nada en el sistema)
 if (ffmpegPath) {
@@ -892,6 +920,7 @@ async function iniciarSocket() {
         markOnlineOnConnect: false,
         syncFullHistory: false
     });
+    sockActual = sock;
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -986,6 +1015,7 @@ const MENU = [
     ['reset', '• !reset - El asistente olvida lo anterior de esta charla (los mensajes siguen guardados)'],
     ['resumen', '• !resumen [n] - Resume los últimos n mensajes guardados de la charla (por defecto 50, máx. ' + RESUMEN_MAX + ')'],
     ['on', '• !on / !off - Activa o desactiva el bot en este grupo (admins)'],
+    ['server', '• !server on / !server status - Enciende o consulta el servidor de Aternos'],
     ['juego', '• !juego - Selecciona un juego al azar'],
     ['addjuego', '• !addjuego <nombre> - Añade un juego'],
     ['listajuegos', '• !listajuegos - Muestra la lista de juegos'],
@@ -1354,6 +1384,48 @@ async function manejarComando(sock, msg, apagado = false) {
             console.error('Error en !todos:', e.message);
             await reaccionar('❌');
             await responder('No pude leer la lista del grupo. Intenta de nuevo.');
+        }
+        return;
+    }
+
+    // Control del servidor de Aternos (lanza un workflow de GitHub Actions)
+    const cmdServer = text.match(/^!server(?:\s+(on|status))?\s*$/i);
+    if (cmdServer) {
+        const accion = (cmdServer[1] || 'status').toLowerCase();
+        if (!process.env.GH_REPO || !process.env.GH_TOKEN) {
+            await reaccionar('❌');
+            await responder('El control del servidor no está configurado.');
+            return;
+        }
+        // Enfriamiento para que nadie lance el workflow en bucle
+        const ahora = Date.now();
+        if (ahora - (globalThis.__ultimoServer || 0) < 90_000) {
+            await reaccionar('❔');
+            await responder('Espera un momento, ya hay una petición reciente.');
+            return;
+        }
+        globalThis.__ultimoServer = ahora;
+        try {
+            await reaccionar('❕');
+            await axios.post(
+                `https://api.github.com/repos/${process.env.GH_REPO}/actions/workflows/aternos.yml/dispatches`,
+                { ref: process.env.GH_REF || 'main', inputs: { accion, chat: jid } },
+                {
+                    headers: {
+                        Authorization: `Bearer ${process.env.GH_TOKEN}`,
+                        Accept: 'application/vnd.github+json',
+                        'X-GitHub-Api-Version': '2022-11-28'
+                    },
+                    timeout: 15_000
+                }
+            );
+            await responder(accion === 'on'
+                ? 'Pidiendo encender el servidor. Te aviso aquí cuando esté listo (puede tardar 1 a 3 minutos).'
+                : 'Consultando el estado del servidor...');
+        } catch (e) {
+            console.error('Error lanzando el workflow de Aternos:', e.response?.status, e.message);
+            await reaccionar('❌');
+            await responder('No pude contactar con el control del servidor.');
         }
         return;
     }
